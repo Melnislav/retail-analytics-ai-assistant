@@ -268,3 +268,165 @@ async def test_end_to_end_chat_glossary_disabled(tmp_path: Path) -> None:
         assert "### Metric Definitions Applied" not in response.reply
     finally:
         await container.shutdown()
+
+
+def test_repeat_customer_calculation_logic() -> None:
+    adapter = LangChainRetailAgentAdapter()
+    plan = adapter._heuristic_sql_plan("Show repeat customer rate and repeat buyers by category")
+    sql = plan.sql_query
+
+    # P1: must calculate share of customers with >= 2 completed orders, not just unique buyers
+    assert "completed_orders >= 2" in sql
+    assert "repeat_customers" in sql
+    assert "repeat_customer_rate_pct" in sql
+    assert "total_customers" in sql
+    assert "total_buyers" not in sql
+
+
+def test_repeat_customer_mock_query_output() -> None:
+    from app.adapters.outbound.bigquery_adapter import AsyncBigQueryAdapter
+
+    bq = AsyncBigQueryAdapter(mock_mode=True)
+    res = bq._execute_simulated_query(
+        "SELECT category, repeat_customers, repeat_customer_rate_pct FROM orders"
+    )
+    assert res.row_count > 0
+    first_row = res.rows[0]
+    assert "repeat_customers" in first_row
+    assert "repeat_customer_rate_pct" in first_row
+    assert "total_customers" in first_row
+    assert first_row["repeat_customer_rate_pct"] > 0
+
+
+def test_fallback_churn_uses_inactivity_not_cancellations() -> None:
+    adapter = LangChainRetailAgentAdapter()
+    plan = adapter._heuristic_sql_plan("Calculate customer churn rate")
+    sql = plan.sql_query
+
+    # P1: must use customer inactivity (default 90 days), not cancellations and returns
+    assert "TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)" in sql
+    assert "churned_customers" in sql
+    assert "churn_rate_pct" in sql
+    assert "COUNTIF(status IN ('Cancelled', 'Returned'))" not in sql
+
+
+def test_fallback_churn_mock_query_output() -> None:
+    from app.adapters.outbound.bigquery_adapter import AsyncBigQueryAdapter
+
+    bq = AsyncBigQueryAdapter(mock_mode=True)
+    res = bq._execute_simulated_query(
+        "SELECT total_active_customers, churned_customers, churn_rate_pct FROM orders WHERE churn"
+    )
+    assert res.row_count == 1
+    row = res.rows[0]
+    assert "total_active_customers" in row
+    assert "churned_customers" in row
+    assert "churn_rate_pct" in row
+    assert row["inactivity_period_days"] == 90
+    assert "completed_orders" not in row  # Not order-level cancellation table
+
+
+def test_user_custom_rule_in_fallback_sql_and_text() -> None:
+    adapter = LangChainRetailAgentAdapter()
+    message = "Рассчитай отток клиентов за 60 дней"
+    plan = adapter._heuristic_sql_plan(message)
+    sql = plan.sql_query
+
+    # P1: custom rule 60 days must be used in SQL calculation
+    assert "INTERVAL 60 DAY" in sql
+
+    # Custom rule 60 days must be detected and reflected in metric definition
+    metrics = adapter._glossary.detect_metrics(message)
+    churn_metric = next((m for m in metrics if m.key == "churn_rate"), None)
+    assert churn_metric is not None
+    assert "60 days" in churn_metric.description
+    assert "60 days" in churn_metric.sql_formula
+
+    formatted = adapter._glossary.format_response_definitions(metrics)
+    assert "60 days" in formatted
+    assert "Custom user-specified metric rule applied" in formatted
+    assert "standard retail glossary definitions applied" not in formatted.lower()
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_user_custom_rule_preservation(tmp_path: Path) -> None:
+    test_settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test_custom_rule_e2e.db",
+        redis_url="redis://invalid-host-uses-memory-fallback:6379/0",
+        bigquery_mock_mode=True,
+        google_api_key="",
+        openai_api_key="",
+    )
+    container = ApplicationContainer(test_settings)
+    await container.startup()
+
+    try:
+        user = UserContext(
+            user_id="ceo_test",
+            display_name="CEO",
+            role=UserRole.CEO,
+            allowed_brands=[],
+        )
+
+        response = await container.chat_orchestrator.handle_message(
+            ChatRequest(
+                session_id="test_custom_rule_sess",
+                message="Рассчитай отток клиентов за 60 дней",
+            ),
+            user,
+        )
+
+        assert response.reply
+        # Preserved in used_metric_definitions
+        assert len(response.used_metric_definitions) > 0
+        assert any("60 days" in d for d in response.used_metric_definitions)
+        # Preserved in text of reply
+        assert "60 days" in response.reply
+        # Used in data calculation preview
+        assert len(response.data_preview) > 0
+        assert response.data_preview[0].get("inactivity_period_days") == 60
+    finally:
+        await container.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_saved_report_metric_definitions_persistence(tmp_path: Path) -> None:
+    from app.adapters.outbound.persistence_adapter import DatabaseManager, PostgresReportRepository
+    from app.domain.models import SavedReport
+
+    db_path = tmp_path / "test_report_persistence.db"
+    db_mgr = DatabaseManager(f"sqlite+aiosqlite:///{db_path}")
+    await db_mgr.init_schema()
+
+    repo = PostgresReportRepository(db_mgr.session_factory)
+    test_defs = [
+        "Customer Churn Rate: buyers with no purchases in 60 days (Formula: SAFE_DIVIDE...)",
+        "Repeat Customer Rate: buyers with 2+ completed orders",
+    ]
+    report = SavedReport(
+        owner_user_id="test_user_1",
+        session_id="session_xyz",
+        title="Q2 Churn & Retention Analysis",
+        summary="Executive summary of churn with custom 60-day rule.",
+        content_markdown="# Report Content\nDetailed analysis here.",
+        action_items=["Review regional marketing", "Deploy reactivation coupon"],
+        sql_used="SELECT * FROM orders",
+        metric_definitions=test_defs,
+    )
+
+    saved = await repo.create(report)
+    assert saved.report_id == report.report_id
+
+    # Retrieve by owner
+    by_owner = await repo.list_by_owner("test_user_1")
+    assert len(by_owner) == 1
+    loaded = by_owner[0]
+    assert loaded.report_id == report.report_id
+    assert loaded.metric_definitions == test_defs
+
+    # Retrieve by session
+    by_sess = await repo.find_by_session("test_user_1", "session_xyz")
+    assert len(by_sess) == 1
+    assert by_sess[0].metric_definitions == test_defs
+
+    await db_mgr.close()

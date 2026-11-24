@@ -118,6 +118,10 @@ class SQLPlan(BaseModel):
         description="False if question can be answered directly from metadata/history without querying BQ.",
     )
     target_tables: list[str] = Field(default_factory=list)
+    applied_metric_definitions: list[str] = Field(
+        default_factory=list,
+        description="Metric definitions and rules applied for this SQL calculation.",
+    )
 
 
 class SQLValidationResult(BaseModel):
@@ -139,6 +143,10 @@ class QueryExecutionResult(BaseModel):
     bytes_processed: int = 0
     from_cache: bool = False
     attempts: int = 1
+    applied_metric_definitions: list[str] = Field(
+        default_factory=list,
+        description="Metric definitions and rules associated with this query calculation.",
+    )
 
 
 class AnalystSynthesis(BaseModel):

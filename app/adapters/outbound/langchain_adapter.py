@@ -360,9 +360,16 @@ class LangChainRetailAgentAdapter:
             HumanMessage(content=user_message),
         ]
         plan = await self._invoke_with_resilience(SQLPlan, messages, "generate_sql_plan")
+        applied_defs = [
+            f"{m.name}: {m.description} (Formula: {m.sql_formula})"
+            for m in self._glossary.detect_metrics(user_message)
+        ]
         if plan is not None:
+            if not plan.applied_metric_definitions:
+                plan = plan.model_copy(update={"applied_metric_definitions": applied_defs})
             return plan
-        return self._heuristic_sql_plan(user_message)
+        fallback_plan = self._heuristic_sql_plan(user_message)
+        return fallback_plan.model_copy(update={"applied_metric_definitions": applied_defs})
 
     def _heuristic_sql_plan(self, user_message: str) -> SQLPlan:
         low = user_message.lower()
@@ -382,13 +389,36 @@ class LangChainRetailAgentAdapter:
                 f"GROUP BY u.state HAVING COUNT(DISTINCT u.id) >= {self._demographic_min_group_size} "
                 f"ORDER BY avg_spend_usd DESC LIMIT 20"
             )
-        elif "churn" in low or "return" in low:
+        elif "churn" in low or "отток" in low:
+            churn_days = 90
+            detected = self._glossary.detect_metrics(user_message)
+            for m in detected:
+                if m.key == "churn_rate":
+                    cd = self._glossary._extract_churn_days(user_message.lower())
+                    if cd is not None:
+                        churn_days = cd
+                    break
+
+            sql = (
+                f"WITH customer_activity AS (\n"
+                f"  SELECT user_id, MAX(created_at) AS last_order_at\n"
+                f"  FROM `{self._dataset_id}.orders`\n"
+                f"  WHERE status = 'Complete'\n"
+                f"  GROUP BY user_id\n"
+                f")\n"
+                f"SELECT \n"
+                f"  COUNT(DISTINCT user_id) AS total_active_customers,\n"
+                f"  COUNT(DISTINCT CASE WHEN last_order_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {churn_days} DAY) THEN user_id END) AS churned_customers,\n"
+                f"  ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN last_order_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {churn_days} DAY) THEN user_id END), COUNT(DISTINCT user_id)) * 100, 2) AS churn_rate_pct\n"
+                f"FROM customer_activity"
+            )
+        elif "return" in low or "cancel" in low or "возврат" in low or "отмен" in low:
             sql = (
                 f"SELECT FORMAT_TIMESTAMP('%Y-%m', created_at) AS month, "
                 f"COUNTIF(status = 'Complete') AS completed_orders, "
                 f"COUNTIF(status = 'Cancelled') AS cancelled_orders, "
                 f"COUNTIF(status = 'Returned') AS returned_orders, "
-                f"ROUND(SAFE_DIVIDE(COUNTIF(status IN ('Cancelled', 'Returned')), COUNT(*)) * 100, 2) AS churn_rate_pct "
+                f"ROUND(SAFE_DIVIDE(COUNTIF(status IN ('Cancelled', 'Returned')), COUNT(*)) * 100, 2) AS return_cancel_rate_pct "
                 f"FROM `{self._dataset_id}.orders` "
                 f"GROUP BY month ORDER BY month DESC LIMIT 12"
             )
@@ -402,14 +432,33 @@ class LangChainRetailAgentAdapter:
                 f"WHERE oi.status NOT IN ('Cancelled', 'Returned') "
                 f"GROUP BY p.category ORDER BY net_revenue_usd DESC LIMIT 20"
             )
-        elif "repeat" in low:
+        elif "repeat" in low or "повторн" in low:
+            min_orders = 2
+            detected = self._glossary.detect_metrics(user_message)
+            for m in detected:
+                if m.key == "repeat_customer_rate":
+                    mo = self._glossary._extract_repeat_threshold(user_message.lower())
+                    if mo is not None:
+                        min_orders = mo
+                    break
+
             sql = (
-                f"SELECT p.category, COUNT(DISTINCT oi.user_id) AS total_buyers, "
-                f"ROUND(SUM(oi.sale_price), 2) AS revenue_usd "
-                f"FROM `{self._dataset_id}.order_items` oi "
-                f"JOIN `{self._dataset_id}.products` p ON oi.product_id = p.id "
-                f"WHERE oi.status = 'Complete' "
-                f"GROUP BY p.category ORDER BY revenue_usd DESC LIMIT 20"
+                f"WITH user_orders AS (\n"
+                f"  SELECT oi.user_id, p.category, COUNT(DISTINCT oi.order_id) AS completed_orders\n"
+                f"  FROM `{self._dataset_id}.order_items` oi\n"
+                f"  JOIN `{self._dataset_id}.products` p ON oi.product_id = p.id\n"
+                f"  WHERE oi.status = 'Complete'\n"
+                f"  GROUP BY oi.user_id, p.category\n"
+                f")\n"
+                f"SELECT \n"
+                f"  category,\n"
+                f"  COUNT(DISTINCT user_id) AS total_customers,\n"
+                f"  COUNT(DISTINCT CASE WHEN completed_orders >= {min_orders} THEN user_id END) AS repeat_customers,\n"
+                f"  ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN completed_orders >= {min_orders} THEN user_id END), COUNT(DISTINCT user_id)) * 100, 2) AS repeat_customer_rate_pct\n"
+                f"FROM user_orders\n"
+                f"GROUP BY category\n"
+                f"ORDER BY repeat_customer_rate_pct DESC\n"
+                f"LIMIT 20"
             )
         elif "gmv" in low:
             sql = (
@@ -449,6 +498,11 @@ class LangChainRetailAgentAdapter:
         matched_metrics = self._glossary.detect_metrics(
             user_message + " " + (query_result.sql_executed if query_result else "")
         )
+        applied_defs = (
+            list(query_result.applied_metric_definitions)
+            if query_result and query_result.applied_metric_definitions
+            else [f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in matched_metrics]
+        )
         glossary_hint = (
             f"\nRelevant Metric Definitions:\n{self._glossary.format_response_definitions(matched_metrics)}\n"
             if matched_metrics
@@ -481,6 +535,8 @@ class LangChainRetailAgentAdapter:
             AnalystSynthesis, messages, "synthesize_response"
         )
         if synthesis is not None:
+            if not synthesis.used_metric_definitions:
+                synthesis = synthesis.model_copy(update={"used_metric_definitions": applied_defs})
             return synthesis
         return self._heuristic_synthesis(user_message, query_result, persona, preferences)
 
@@ -494,9 +550,11 @@ class LangChainRetailAgentAdapter:
         matched_metrics = self._glossary.detect_metrics(
             user_message + " " + (query_result.sql_executed if query_result else "")
         )
-        used_defs = [
-            f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in matched_metrics
-        ]
+        used_defs = (
+            list(query_result.applied_metric_definitions)
+            if query_result and query_result.applied_metric_definitions
+            else [f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in matched_metrics]
+        )
         glossary_section = (
             "\n\n" + self._glossary.format_response_definitions(matched_metrics)
             if matched_metrics

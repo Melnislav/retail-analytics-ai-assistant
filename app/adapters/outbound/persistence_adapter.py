@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import datetime
 
@@ -32,6 +33,7 @@ class SavedReportORM(Base):
     content_markdown: Mapped[str] = mapped_column(Text)
     action_items_json: Mapped[str] = mapped_column(Text, default="[]")
     sql_used: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metric_definitions_json: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -47,6 +49,10 @@ class DatabaseManager:
     async def init_schema(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            with contextlib.suppress(Exception):
+                await conn.exec_driver_sql(
+                    "ALTER TABLE saved_reports ADD COLUMN metric_definitions_json TEXT DEFAULT '[]'"
+                )
 
     async def close(self) -> None:
         await self.engine.dispose()
@@ -60,6 +66,11 @@ class PostgresReportRepository:
 
     @staticmethod
     def _to_domain(row: SavedReportORM) -> SavedReport:
+        raw_defs = getattr(row, "metric_definitions_json", None) or "[]"
+        try:
+            metric_defs = json.loads(raw_defs) if isinstance(raw_defs, str) else list(raw_defs)
+        except Exception:
+            metric_defs = []
         return SavedReport(
             report_id=row.report_id,
             owner_user_id=row.owner_user_id,
@@ -69,6 +80,7 @@ class PostgresReportRepository:
             content_markdown=row.content_markdown,
             action_items=json.loads(row.action_items_json or "[]"),
             sql_used=row.sql_used,
+            metric_definitions=metric_defs,
             created_at=row.created_at,
         )
 
@@ -84,6 +96,7 @@ class PostgresReportRepository:
                     content_markdown=report.content_markdown,
                     action_items_json=json.dumps(report.action_items),
                     sql_used=report.sql_used,
+                    metric_definitions_json=json.dumps(report.metric_definitions),
                     created_at=report.created_at,
                 )
             )

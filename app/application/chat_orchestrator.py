@@ -121,6 +121,7 @@ class ChatOrchestratorService:
             if plan is None or not plan.requires_sql:
                 return {"query_result": None}
 
+            applied_defs = list(plan.applied_metric_definitions) if plan else []
             attempt = state.get("attempt", 1)
             trace_id = state.get("trace_id", "")
             user = state["user_context"]
@@ -148,6 +149,10 @@ class ChatOrchestratorService:
                 cached_result = QueryExecutionResult(
                     **cached_payload, from_cache=True, attempts=attempt
                 )
+                if applied_defs and not cached_result.applied_metric_definitions:
+                    cached_result = cached_result.model_copy(
+                        update={"applied_metric_definitions": applied_defs}
+                    )
                 masked_rows, row_redactions = self._masker.mask_rows(cached_result.rows)
                 self._obs.increment_metric("bq_cache_hits")
                 return {
@@ -188,6 +193,7 @@ class ChatOrchestratorService:
                     bytes_processed=raw_result.bytes_processed,
                     from_cache=False,
                     attempts=attempt,
+                    applied_metric_definitions=applied_defs,
                 )
                 await self._cache.set_json(
                     cache_key,
@@ -446,6 +452,8 @@ class ChatOrchestratorService:
         pii_redactions_total = workflow_state.get("redactions_count", 0)
 
         used_metrics_list = list(synthesis.used_metric_definitions)
+        if not used_metrics_list and query_result and query_result.applied_metric_definitions:
+            used_metrics_list = list(query_result.applied_metric_definitions)
         if not used_metrics_list:
             detected = self._glossary.detect_metrics(
                 request.message + " " + (query_result.sql_executed if query_result else "")

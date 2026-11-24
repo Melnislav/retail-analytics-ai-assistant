@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import re
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -64,28 +66,22 @@ DEFAULT_METRICS: dict[str, MetricDefinition] = {
     "churn_rate": MetricDefinition(
         key="churn_rate",
         name="Customer Churn Rate",
-        description=(
-            "Customer churn: buyers with completed orders who placed no purchases in the last 90 days. "
-            "Order churn: share of cancelled and returned orders."
-        ),
+        description="Customer churn: buyers with completed orders who placed no purchases in the last 90 days.",
         sql_formula=(
-            "Customer-level: SAFE_DIVIDE(COUNT(DISTINCT churned_user_id), COUNT(DISTINCT total_user_id)) * 100 "
-            "(churned = no orders in past 90 days); "
-            "Order-level: ROUND(SAFE_DIVIDE(COUNTIF(status IN ('Cancelled', 'Returned')), COUNT(*)) * 100, 2)"
+            "SAFE_DIVIDE(COUNT(DISTINCT churned_user_id), COUNT(DISTINCT total_user_id)) * 100 "
+            "(churned = no orders in past 90 days)"
         ),
         business_rule=(
-            "Default customer churn threshold is 90 days of purchase inactivity following a completed order. "
-            "Order-level cancellation/return rate is used for transactional trend analysis."
+            "Default customer churn threshold is 90 days of purchase inactivity following a completed order."
         ),
-        override_hint="Override example: 'define churn as no purchase in 60 days' or 'define churn as cancelled orders only'",
+        override_hint="Override example: 'define churn as no purchase in 60 days' or 'calculate churn for 60 days'",
         keywords=[
             "churn",
             "churned",
             "retention",
             "attrition",
             "lost customer",
-            "cancelled",
-            "returned",
+            "отток",
         ],
     ),
     "gross_margin": MetricDefinition(
@@ -105,11 +101,11 @@ DEFAULT_METRICS: dict[str, MetricDefinition] = {
         name="Repeat Customer Rate",
         description="Percentage of active purchasers who have placed 2 or more completed orders.",
         sql_formula=(
-            "ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN order_count > 1 THEN user_id END), "
+            "ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN completed_orders >= 2 THEN user_id END), "
             "COUNT(DISTINCT user_id)) * 100, 2)"
         ),
         business_rule=(
-            "Evaluates customer retention and brand loyalty across shoppers who have completed at least one order."
+            "Evaluates customer retention and brand loyalty as share of customers with 2 or more completed orders."
         ),
         override_hint="Override example: 'define repeat customer as placed 3 or more orders'",
         keywords=[
@@ -119,6 +115,7 @@ DEFAULT_METRICS: dict[str, MetricDefinition] = {
             "loyalty",
             "re-order",
             "frequent buyer",
+            "повторн",
         ],
     ),
     "aov": MetricDefinition(
@@ -196,8 +193,46 @@ class SemanticGlossary:
         )
         return "\n".join(lines)
 
+    @staticmethod
+    def _extract_churn_days(low: str) -> int | None:
+        """Extract user-specified churn inactivity days (e.g., 60 days)."""
+        patterns = [
+            r"interval\s+(\d+)\s+day",
+            r"(?:churn|отток|inactivity|покупок|purchase|purchases)[^\n.]{0,40}?(\d+)\s*(?:days?|дней|дня|дн)",
+            r"(\d+)\s*(?:days?|дней|дня|дн)[^\n.]{0,40}?(?:churn|отток|inactivity|покупок|purchase|purchases)",
+            r"(?:churn|отток)[^\n.]{0,30}?(\d+)",
+        ]
+        for pat in patterns:
+            match = re.search(pat, low)
+            if match:
+                with contextlib.suppress(ValueError):
+                    val = int(match.group(1))
+                    if 0 < val <= 3650:
+                        return val
+        return None
+
+    @staticmethod
+    def _extract_repeat_threshold(low: str) -> int | None:
+        """Extract user-specified minimum completed orders for repeat customer rate (e.g. 3+ orders)."""
+        patterns = [
+            r"completed_orders\s*>=\s*(\d+)",
+            r"(?:repeat|повторн)[^\n.]{0,40}?(\d+)\+?\s*(?:orders?|заказ)",
+            r"(\d+)\+?\s*(?:orders?|заказ)[^\n.]{0,40}?(?:repeat|повторн)",
+            r"(?:repeat customer as|повторные клиенты как)[^\n.]{0,30}?(\d+)",
+        ]
+        for pat in patterns:
+            match = re.search(pat, low)
+            if match:
+                with contextlib.suppress(ValueError):
+                    val = int(match.group(1))
+                    if 1 <= val <= 100:
+                        return val
+        return None
+
     def detect_metrics(self, text: str) -> list[MetricDefinition]:
-        """Identify which metrics are referenced in the question or SQL text."""
+        """Identify which metrics are referenced in the question or SQL text,
+        and dynamically apply any custom user-specified rule overrides (e.g. 60 days churn).
+        """
         if not self._enabled:
             return []
 
@@ -205,7 +240,68 @@ class SemanticGlossary:
         matched: list[MetricDefinition] = []
         for metric in self._metrics.values():
             if metric.key in low or any(kw in low for kw in metric.keywords):
-                matched.append(metric)
+                resolved_metric = metric
+                if metric.key == "churn_rate":
+                    custom_days = self._extract_churn_days(low)
+                    if custom_days is not None and custom_days != 90:
+                        resolved_metric = metric.model_copy(
+                            update={
+                                "description": (
+                                    f"Customer churn: buyers with completed orders who placed no purchases "
+                                    f"in the last {custom_days} days (User custom rule: {custom_days} days)."
+                                ),
+                                "sql_formula": (
+                                    f"SAFE_DIVIDE(COUNT(DISTINCT churned_user_id), COUNT(DISTINCT total_user_id)) * 100 "
+                                    f"(churned = no orders in past {custom_days} days)"
+                                ),
+                                "business_rule": (
+                                    f"User-specified churn threshold: {custom_days} days of purchase inactivity "
+                                    f"following a completed order."
+                                ),
+                            }
+                        )
+                elif metric.key == "repeat_customer_rate":
+                    custom_orders = self._extract_repeat_threshold(low)
+                    if custom_orders is not None and custom_orders != 2:
+                        resolved_metric = metric.model_copy(
+                            update={
+                                "description": (
+                                    f"Percentage of active purchasers who have placed {custom_orders} or more completed orders "
+                                    f"(User custom rule: {custom_orders}+ orders)."
+                                ),
+                                "sql_formula": (
+                                    f"ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN completed_orders >= {custom_orders} THEN user_id END), "
+                                    f"COUNT(DISTINCT user_id)) * 100, 2)"
+                                ),
+                                "business_rule": (
+                                    f"User-specified repeat threshold: {custom_orders} or more completed orders."
+                                ),
+                            }
+                        )
+                elif metric.key == "net_revenue":
+                    if any(
+                        phrase in low
+                        for phrase in [
+                            "including return",
+                            "including returns",
+                            "с возвратами",  # noqa: RUF001
+                            "с учетом возвратов",  # noqa: RUF001
+                        ]
+                    ):
+                        resolved_metric = metric.model_copy(
+                            update={
+                                "name": "Revenue (Including Returns)",
+                                "description": (
+                                    "Total recognized revenue including returned items "
+                                    "(User custom rule: including returns)."
+                                ),
+                                "sql_formula": "SUM(sale_price) WHERE status != 'Cancelled'",
+                                "business_rule": (
+                                    "User-specified rule: includes returned items in revenue calculation."
+                                ),
+                            }
+                        )
+                matched.append(resolved_metric)
         return matched
 
     def format_response_definitions(
@@ -226,10 +322,17 @@ class SemanticGlossary:
             lines.append(f"- **{m.name}**: {m.description} *(Formula: `{m.sql_formula}`)*")
 
         if include_override_note:
-            lines.append(
-                "\n*(Note: Standard retail glossary definitions applied. "
-                "You can override any metric definition directly in your prompt, e.g. "
-                "'define churn as no purchase in 60 days' or 'calculate revenue including returns'.)*"
-            )
+            has_custom = any("User custom rule" in m.description for m in active_metrics)
+            if has_custom:
+                lines.append(
+                    "\n*(Note: Custom user-specified metric rule applied for this calculation. "
+                    "You can override any metric definition directly in your prompt.)*"
+                )
+            else:
+                lines.append(
+                    "\n*(Note: Standard retail glossary definitions applied. "
+                    "You can override any metric definition directly in your prompt, e.g. "
+                    "'define churn as no purchase in 60 days' or 'calculate revenue including returns'.)*"
+                )
 
         return "\n".join(lines)
