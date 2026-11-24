@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary & Architectural Principles
 
-The **Retail Data Analysis Chat Assistant** is an enterprise-grade AI solution designed for non-technical executive teams (e.g., OpsFleet executive managers, CEOs) to query complex retail transactional data using natural language. The system executes dynamic SQL queries against Google BigQuery's public dataset (`bigquery-public-data.thelook_ecommerce`), synthesizes actionable business insights, manages a library of saved executive reports, and exposes extensible hooks for future capabilities (e.g., automated charting, email distribution, web trend analysis).
+The **Retail Data Analysis Chat Assistant** is an enterprise-grade AI solution designed for non-technical executive teams (e.g., retail managers and CEOs) to query complex retail transactional data using natural language. The system executes dynamic SQL queries against Google BigQuery's public dataset (`bigquery-public-data.thelook_ecommerce`), synthesizes actionable business insights, manages a library of saved executive reports, and exposes extensible hooks for future capabilities (e.g., automated charting, email distribution, web trend analysis).
 
 ### Core Architectural Principles
 * **Domain-Driven Design (DDD):** Domain logic, security governance, and analytical policies are decoupled from external infrastructure adapters.
@@ -36,7 +36,7 @@ Per assessment guidelines (Deliverable #6), the technical stack was selected bas
 
 ## 3. Production Workload Sizing & Target AWS Infrastructure Topology
 
-The production design is calibrated for OpsFleet's operational parameters: **~100 active executive managers per day**, generating **~10 analytical queries per manager per day** (~1,000 queries/day total), saving **~1 report per manager per day**, and requiring simple query responses within **10–30 seconds** and complex report generation within **1–2 minutes**.
+The production design is calibrated for the following operational parameters: **~100 active executive managers per day**, generating **~10 analytical queries per manager per day** (~1,000 queries/day total), saving **~1 report per manager per day**, and requiring simple query responses within **10–30 seconds** and complex report generation within **1–2 minutes**.
 
 ### Production Infrastructure Topology (AWS + Google Cloud)
 

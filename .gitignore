@@ -13,7 +13,7 @@ client_secret*.json
 *.db-shm
 *.sqlite
 *.sqlite3
-opsfleet_local.db
+retail_assistant_local.db
 
 __pycache__/
 *.py[cod]

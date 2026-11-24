@@ -1,4 +1,4 @@
-"""Interactive CLI chat interface for the OpsFleet Retail Data Analysis Assistant."""
+"""Interactive CLI chat interface for the Retail Data Analysis Assistant."""
 
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ class RetailAssistantCLI:
         )
 
     def print_banner(self) -> None:
-        app_title = os.getenv("APP_NAME", "OpsFleet Retail Data Analysis Assistant")
+        app_title = os.getenv("APP_NAME", "Retail Data Analysis Assistant")
         mode_str = "Direct In-Process" if self.standalone else f"HTTP: {self.base_url}"
         console.print(
             Panel.fit(
@@ -382,7 +382,7 @@ class RetailAssistantCLI:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="OpsFleet Retail Assistant CLI")
+    parser = argparse.ArgumentParser(description="Retail Assistant CLI")
     parser.add_argument(
         "--standalone",
         action="store_true",

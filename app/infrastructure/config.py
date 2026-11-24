@@ -58,9 +58,7 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    app_name: str = Field(
-        default="Retail Data Analysis Assistant", validation_alias="APP_NAME"
-    )
+    app_name: str = Field(default="Retail Data Analysis Assistant", validation_alias="APP_NAME")
     app_env: str = Field(default="production", validation_alias="APP_ENV")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
     api_host: str = Field(default="0.0.0.0", validation_alias="API_HOST")
