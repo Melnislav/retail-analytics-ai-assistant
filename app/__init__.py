@@ -1,1 +1,1 @@
-"""OpsFleet Retail Data Analysis Assistant package."""
+"""Retail Data Analysis Assistant package."""

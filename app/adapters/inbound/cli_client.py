@@ -1,4 +1,4 @@
-"""Interactive CLI chat interface for the OpsFleet Retail Data Analysis Assistant."""
+"""Interactive CLI chat interface for the Retail Data Analysis Assistant."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ class RetailAssistantCLI:
         }
 
     def print_banner(self) -> None:
-        app_title = os.getenv("APP_NAME", "OpsFleet Retail Data Analysis Assistant")
+        app_title = os.getenv("APP_NAME", "Retail Data Analysis Assistant")
         console.print(
             Panel.fit(
                 f"[bold cyan]{app_title} (CLI)[/bold cyan]\n"
@@ -145,7 +145,7 @@ class RetailAssistantCLI:
                     console.print(
                         Panel(
                             f"[bold red]Could not connect to analytics backend ({self.base_url}).[/bold red]\n\n"
-                            "Please ensure the [bold cyan]opsfleet-api[/bold cyan] container or server is running.",
+                            "Please ensure the [bold cyan]retail-api[/bold cyan] container or server is running.",
                             title="[bold red]Connection Error[/bold red]",
                             border_style="red",
                         )

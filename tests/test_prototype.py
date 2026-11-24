@@ -240,7 +240,7 @@ def test_http_identity_uses_brands_and_rejects_unknown_roles() -> None:
 @pytest.mark.asyncio
 async def test_end_to_end_report_creation_and_two_step_deletion(tmp_path: Path) -> None:
     test_settings = Settings(
-        database_url=f"sqlite+aiosqlite:///{tmp_path}/test_opsfleet.db",
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test_retail.db",
         redis_url="redis://invalid-host-uses-memory-fallback:6379/0",
         bigquery_mock_mode=True,
         google_api_key="",
@@ -301,7 +301,7 @@ async def test_end_to_end_report_creation_and_two_step_deletion(tmp_path: Path) 
 
 def test_settings_and_container_wiring() -> None:
     custom_settings = Settings(
-        app_name="Custom OpsFleet Retail Assistant",
+        app_name="Custom retail Retail Assistant",
         app_env="testing",
         bq_dataset_id="custom-project.custom_retail_dataset",
         bq_query_timeout_seconds=42,
@@ -331,7 +331,7 @@ def test_settings_and_container_wiring() -> None:
 @pytest.mark.asyncio
 async def test_langgraph_sql_workflow_execution(tmp_path: Path) -> None:
     test_settings = Settings(
-        database_url=f"sqlite+aiosqlite:///{tmp_path}/test_opsfleet.db",
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test_retail.db",
         redis_url="redis://invalid-host-uses-memory-fallback:6379/0",
         bigquery_mock_mode=True,
         google_api_key="",

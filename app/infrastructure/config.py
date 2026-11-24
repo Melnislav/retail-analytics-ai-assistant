@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = Field(
-        default="OpsFleet Retail Data Analysis Assistant", validation_alias="APP_NAME"
+        default="Retail Data Analysis Assistant", validation_alias="APP_NAME"
     )
     app_env: str = Field(default="production", validation_alias="APP_ENV")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
@@ -51,7 +51,7 @@ class Settings(BaseSettings):
 
     # Database & Redis
     database_url: str = Field(
-        default="sqlite+aiosqlite:///./opsfleet_local.db", validation_alias="DATABASE_URL"
+        default="sqlite+aiosqlite:///./retail_local.db", validation_alias="DATABASE_URL"
     )
     redis_url: str = Field(default="redis://localhost:6379/0", validation_alias="REDIS_URL")
     confirmation_ttl_seconds: int = Field(default=600, validation_alias="CONFIRMATION_TTL_SECONDS")
@@ -72,7 +72,7 @@ class Settings(BaseSettings):
         default=86400, validation_alias="CHAT_HISTORY_TTL_SECONDS"
     )
     # Data Protection & PII
-    pii_salt: str = Field(default="opsfleet-pii-salt-2026", validation_alias="PII_SALT")
+    pii_salt: str = Field(default="retail-pii-salt-2026", validation_alias="PII_SALT")
     demographic_min_group_size: int = Field(
         default=5,
         ge=2,
