@@ -1,0 +1,81 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: opsfleet-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-opsfleet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-opsfleet_secret_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-opsfleet_assistant}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - opsfleet_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-opsfleet} -d ${POSTGRES_DB:-opsfleet_assistant} -p 5432"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: opsfleet-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - opsfleet_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opsfleet-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-opsfleet}:${POSTGRES_PASSWORD:-opsfleet_secret_pass}@postgres:5432/${POSTGRES_DB:-opsfleet_assistant}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    ports:
+      - "${API_PORT:-8000}:${API_PORT:-8000}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${API_PORT:-8000}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opsfleet-cli
+    profiles:
+      - cli
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: ${API_BASE_URL:-http://api:${API_PORT:-8000}}
+    depends_on:
+      api:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    command: ["python", "-m", "app.adapters.inbound.cli_client"]
+
+volumes:
+  opsfleet_pgdata:
+  opsfleet_redisdata:
