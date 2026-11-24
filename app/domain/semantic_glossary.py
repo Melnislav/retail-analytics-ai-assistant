@@ -165,6 +165,19 @@ class SemanticGlossary:
                                 "COUNT(DISTINCT total_user_id)) * 100 "
                                 f"(churned = no orders in past {churn_days} days)"
                             )
+                    elif key == "repeat_customer_rate":
+                        min_orders = self._extract_repeat_threshold(val.lower())
+                        if min_orders is not None:
+                            update["sql_formula"] = (
+                                "ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN completed_orders "
+                                f">= {min_orders} THEN user_id END), "
+                                "COUNT(DISTINCT user_id)) * 100, 2)"
+                            )
+                    elif key == "aov" and self._includes_returns(val):
+                        update["sql_formula"] = (
+                            "ROUND(SAFE_DIVIDE(SUM(sale_price), COUNT(DISTINCT order_id)), 2) "
+                            "WHERE status != 'Cancelled'"
+                        )
                     self._metrics[key] = existing.model_copy(update=update)
 
     @property
@@ -273,13 +286,33 @@ class SemanticGlossary:
             )
         )
 
+    def aov_includes_returns(self, user_message: str) -> bool:
+        """Return whether the AOV rule includes returned items."""
+        if not any(metric.key == "aov" for metric in self.detect_metrics(user_message)):
+            return False
+        if self._includes_returns(user_message):
+            return True
+
+        aov_metric = self.get_metric("aov")
+        if aov_metric is None:
+            return False
+        return self._includes_returns(
+            " ".join(
+                [
+                    aov_metric.description,
+                    aov_metric.sql_formula,
+                    aov_metric.business_rule,
+                ]
+            )
+        )
+
     @staticmethod
     def _extract_repeat_threshold(low: str) -> int | None:
         """Extract user-specified minimum completed orders for repeat customer rate (e.g. 3+ orders)."""
         patterns = [
             r"completed_orders\s*>=\s*(\d+)",
-            r"(?:repeat|повторн)[^\n.]{0,40}?(\d+)\+?\s*(?:orders?|заказ)",
-            r"(\d+)\+?\s*(?:orders?|заказ)[^\n.]{0,40}?(?:repeat|повторн)",
+            r"(?:repeat|повторн)[^\n.]{0,40}?(\d+)\s*(?:\+|or more)?\s*(?:completed\s+)?(?:orders?|заказ)",
+            r"(\d+)\s*(?:\+|or more)?\s*(?:completed\s+)?(?:orders?|заказ)[^\n.]{0,40}?(?:repeat|повторн)",
             r"(?:repeat customer as|повторные клиенты как)[^\n.]{0,30}?(\d+)",
         ]
         for pat in patterns:
@@ -290,6 +323,28 @@ class SemanticGlossary:
                     if 1 <= val <= 100:
                         return val
         return None
+
+    def repeat_customer_min_orders(self, user_message: str) -> int:
+        """Resolve a user override or configured default repeat-order threshold."""
+        user_override = self._extract_repeat_threshold(user_message.lower())
+        if user_override is not None:
+            return user_override
+
+        repeat_metric = self.get_metric("repeat_customer_rate")
+        if repeat_metric is None:
+            return 2
+        return (
+            self._extract_repeat_threshold(
+                " ".join(
+                    [
+                        repeat_metric.description,
+                        repeat_metric.sql_formula,
+                        repeat_metric.business_rule,
+                    ]
+                ).lower()
+            )
+            or 2
+        )
 
     def detect_metrics(self, text: str) -> list[MetricDefinition]:
         """Identify which metrics are referenced in the question or SQL text,
@@ -351,6 +406,22 @@ class SemanticGlossary:
                             "sql_formula": "SUM(sale_price) WHERE status != 'Cancelled'",
                             "business_rule": (
                                 "User-specified rule: includes returned items in revenue calculation."
+                            ),
+                        }
+                    )
+                elif metric.key == "aov" and self._includes_returns(low):
+                    resolved_metric = metric.model_copy(
+                        update={
+                            "description": (
+                                "Average monetary value per order, including returned items "
+                                "(User custom rule: including returns)."
+                            ),
+                            "sql_formula": (
+                                "ROUND(SAFE_DIVIDE(SUM(sale_price), COUNT(DISTINCT order_id)), 2) "
+                                "WHERE status != 'Cancelled'"
+                            ),
+                            "business_rule": (
+                                "User-specified rule: includes returned items and excludes cancelled items."
                             ),
                         }
                     )

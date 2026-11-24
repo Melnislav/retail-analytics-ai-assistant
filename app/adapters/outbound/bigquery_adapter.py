@@ -354,9 +354,38 @@ class AsyncBigQueryAdapter:
                     "inactivity_period_days": days,
                 }
             ]
+            if "RETURN_TREND" in q_upper:
+                rows = [
+                    {
+                        "month": "2026-08",
+                        "completed_orders": 6120,
+                        "cancelled_orders": 740,
+                        "returned_orders": 610,
+                        "return_cancel_rate_pct": 18.1,
+                        **rows[0],
+                    },
+                    {
+                        "month": "2026-09",
+                        "completed_orders": 6340,
+                        "cancelled_orders": 790,
+                        "returned_orders": 645,
+                        "return_cancel_rate_pct": 18.5,
+                        **rows[0],
+                    },
+                    {
+                        "month": "2026-10",
+                        "completed_orders": 5890,
+                        "cancelled_orders": 1180,
+                        "returned_orders": 890,
+                        "return_cancel_rate_pct": 26.0,
+                        **rows[0],
+                    },
+                ]
         elif "REPEAT" in q_upper:
             min_orders = 2
-            m_orders = re.search(r"COMPLETED_ORDERS\s*>=\s*(\d+)", q_upper)
+            m_orders = re.search(
+                r"(?:COMPLETED_ORDERS|COUNT\(DISTINCT\s+ORDER_ID\))\s*>=\s*(\d+)", q_upper
+            )
             if m_orders:
                 with contextlib.suppress(ValueError):
                     min_orders = int(m_orders.group(1))

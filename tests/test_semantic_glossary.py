@@ -348,6 +348,46 @@ def test_fallback_combines_churn_and_return_trend() -> None:
     assert "return_trend.*" not in plan.sql_query
 
 
+def test_fallback_aov_including_returns_uses_matching_definition() -> None:
+    adapter = LangChainRetailAgentAdapter()
+
+    plan = adapter._heuristic_sql_plan("Calculate AOV across all orders including returned items")
+
+    assert "status != 'Cancelled'" in plan.sql_query
+    assert "status = 'Complete'" not in plan.sql_query
+    metric = adapter._glossary.detect_metrics("Calculate AOV including returned items")[0]
+    assert "including returned items" in metric.description
+
+
+def test_fallback_repeat_customer_uses_configured_threshold_in_mock_mode() -> None:
+    from app.adapters.outbound.bigquery_adapter import AsyncBigQueryAdapter
+
+    glossary = SemanticGlossary(
+        custom_definitions={"repeat_customer_rate": "Repeat customer: 3 or more completed orders."}
+    )
+    plan = LangChainRetailAgentAdapter(glossary=glossary)._heuristic_sql_plan(
+        "Show repeat customer rate"
+    )
+    result = AsyncBigQueryAdapter(mock_mode=True)._execute_simulated_query(plan.sql_query)
+
+    assert "COUNT(DISTINCT order_id) >= 3" in plan.sql_query
+    assert result.rows[0]["repeat_customers"] == 888
+
+
+def test_mock_mode_combines_churn_and_return_trend() -> None:
+    from app.adapters.outbound.bigquery_adapter import AsyncBigQueryAdapter
+
+    plan = LangChainRetailAgentAdapter()._heuristic_sql_plan(
+        "What is our churn rate and return trend?"
+    )
+    result = AsyncBigQueryAdapter(mock_mode=True)._execute_simulated_query(plan.sql_query)
+
+    assert result.row_count == 3
+    assert "month" in result.rows[0]
+    assert "churn_rate_pct" in result.rows[0]
+    assert "return_cancel_rate_pct" in result.rows[0]
+
+
 def test_fallback_revenue_including_returns_uses_revenue_query() -> None:
     adapter = LangChainRetailAgentAdapter()
 

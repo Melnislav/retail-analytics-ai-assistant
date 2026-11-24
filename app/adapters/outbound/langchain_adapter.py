@@ -423,10 +423,15 @@ class LangChainRetailAgentAdapter:
                 f"ORDER BY month DESC LIMIT 12"
             )
         elif "aov" in low or "average order value" in low or "basket size" in low:
+            status_filter = (
+                "status != 'Cancelled'"
+                if self._glossary.aov_includes_returns(user_message)
+                else "status = 'Complete'"
+            )
             sql = (
                 f"SELECT ROUND(SAFE_DIVIDE(SUM(sale_price), COUNT(DISTINCT order_id)), 2) AS aov_usd "
                 f"FROM `{self._dataset_id}.order_items` "
-                f"WHERE status = 'Complete'"
+                f"WHERE {status_filter}"
             )
         elif has_churn:
             churn_days = self._glossary.churn_inactivity_days(user_message)
@@ -473,14 +478,7 @@ class LangChainRetailAgentAdapter:
                 f"GROUP BY p.category ORDER BY net_revenue_usd DESC LIMIT 20"
             )
         elif "repeat" in low or "повторн" in low:
-            min_orders = 2
-            detected = self._glossary.detect_metrics(user_message)
-            for m in detected:
-                if m.key == "repeat_customer_rate":
-                    mo = self._glossary._extract_repeat_threshold(user_message.lower())
-                    if mo is not None:
-                        min_orders = mo
-                    break
+            min_orders = self._glossary.repeat_customer_min_orders(user_message)
 
             sql = (
                 f"WITH scoped_orders AS (\n"
