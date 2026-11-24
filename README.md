@@ -1,8 +1,8 @@
-# OpsFleet Retail Data Analysis Chat Assistant
+# Retail Data Analysis Chat Assistant
 
-Production-ready **Ports & Adapters (Hexagonal Architecture)** prototype built with **Python 3.12 (`asyncio`)**, **FastAPI**, **Pydantic v2**, **LangChain**, **BigQuery**, **PostgreSQL**, and **Redis**.
+Production-ready prototype built with Python.
 
-## Project Structure (Hexagonal / Ports & Adapters)
+## Project Structure
 
 ```text
 .
