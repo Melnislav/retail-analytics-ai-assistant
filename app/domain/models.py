@@ -149,6 +149,10 @@ class AnalystSynthesis(BaseModel):
     action_items: list[str] = Field(default_factory=list)
     follow_up_suggestions: list[str] = Field(default_factory=list)
     report_title: str | None = None
+    used_metric_definitions: list[str] = Field(
+        default_factory=list,
+        description="Explicit retail metric definitions applied during this analysis turn.",
+    )
 
 
 class SavedReport(BaseModel):
@@ -162,6 +166,7 @@ class SavedReport(BaseModel):
     content_markdown: str
     action_items: list[str] = Field(default_factory=list)
     sql_used: str | None = None
+    metric_definitions: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -223,3 +228,7 @@ class ChatResponse(BaseModel):
     saved_report_id: str | None = None
     pending_confirmation: PendingConfirmation | None = None
     observability: dict[str, Any] = Field(default_factory=dict)
+    used_metric_definitions: list[str] = Field(
+        default_factory=list,
+        description="Explicit retail metric definitions applied during this analysis turn.",
+    )

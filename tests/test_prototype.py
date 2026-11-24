@@ -323,6 +323,9 @@ def test_settings_and_container_wiring() -> None:
     assert container.sql_policy._default_limit == 150
     assert container.sql_policy._demographic_min_group_size == 7
     assert container.sql_policy._dataset_id == "custom-project.custom_retail_dataset"
+    assert container.glossary is not None
+    assert container.llm_agent._glossary is container.glossary
+    assert container.chat_orchestrator._glossary is container.glossary
 
 
 @pytest.mark.asyncio

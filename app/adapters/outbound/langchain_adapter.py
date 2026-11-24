@@ -24,6 +24,7 @@ from app.domain.models import (
     UserPreferenceProfile,
 )
 from app.domain.pii_masker import PIIMasker
+from app.domain.semantic_glossary import SemanticGlossary
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +55,12 @@ class LangChainRetailAgentAdapter:
         dataset_id: str = "bigquery-public-data.thelook_ecommerce",
         demographic_min_group_size: int = 5,
         pii_masker: PIIMasker | None = None,
+        glossary: SemanticGlossary | None = None,
     ) -> None:
         self._dataset_id = dataset_id
         self._demographic_min_group_size = demographic_min_group_size
         self._pii_masker = pii_masker or PIIMasker()
+        self._glossary = glossary or SemanticGlossary()
         self._providers: list[LLMProvider] = self._build_providers(
             provider=provider,
             google_api_key=google_api_key,
@@ -334,17 +337,20 @@ class LangChainRetailAgentAdapter:
                 "Fix the SQL query carefully so it executes cleanly on BigQuery StandardSQL."
             )
 
+        glossary_rules = self._glossary.format_system_prompt_section()
         system_prompt = (
             "You are a Principal Retail Data Analyst generating BigQuery StandardSQL.\n"
             f"Available Schema:\n{schema_summary}\n\n"
+            f"{glossary_rules}\n\n"
             "STRICT RULES:\n"
             f"1. Generate ONLY read-only SELECT queries against `{self._dataset_id}`.\n"
             "2. NEVER select PII columns (`first_name`, `last_name`, `email`, `street_address`, `postal_code`, `latitude`, `longitude`).\n"
             "3. Demographics (`age`, `gender`, `city`, `state`, `country`, `traffic_source`) "
             "must only appear as GROUP BY dimensions and must include "
-            f"HAVING COUNT(DISTINCT customer) >= {self._demographic_min_group_size}.\n"
+            f"HAVING COUNT(DISTINCT u.id) >= {self._demographic_min_group_size}.\n"
             "4. Always aggregate metrics cleanly (ROUND floats to 2 decimals) and include an ORDER BY + LIMIT.\n"
-            "5. If the user asks about available tables/schema structure only, set `requires_sql=False`."
+            "5. If the user asks about available tables/schema structure only, set `requires_sql=False`.\n"
+            "6. Always adhere to the business metric formulas in the Semantic Glossary above, unless the user provides their own explicit definition in their prompt."
             f"{retry_context}"
         )
 
@@ -386,17 +392,44 @@ class LangChainRetailAgentAdapter:
                 f"FROM `{self._dataset_id}.orders` "
                 f"GROUP BY month ORDER BY month DESC LIMIT 12"
             )
+        elif "margin" in low or "profit" in low:
+            sql = (
+                f"SELECT p.category, ROUND(SUM(oi.sale_price), 2) AS net_revenue_usd, "
+                f"ROUND(SUM(oi.sale_price - p.cost), 2) AS gross_profit_usd, "
+                f"ROUND(SAFE_DIVIDE(SUM(oi.sale_price - p.cost), SUM(oi.sale_price)) * 100, 2) AS gross_margin_pct "
+                f"FROM `{self._dataset_id}.order_items` oi "
+                f"JOIN `{self._dataset_id}.products` p ON oi.product_id = p.id "
+                f"WHERE oi.status NOT IN ('Cancelled', 'Returned') "
+                f"GROUP BY p.category ORDER BY net_revenue_usd DESC LIMIT 20"
+            )
+        elif "repeat" in low:
+            sql = (
+                f"SELECT p.category, COUNT(DISTINCT oi.user_id) AS total_buyers, "
+                f"ROUND(SUM(oi.sale_price), 2) AS revenue_usd "
+                f"FROM `{self._dataset_id}.order_items` oi "
+                f"JOIN `{self._dataset_id}.products` p ON oi.product_id = p.id "
+                f"WHERE oi.status = 'Complete' "
+                f"GROUP BY p.category ORDER BY revenue_usd DESC LIMIT 20"
+            )
+        elif "gmv" in low:
+            sql = (
+                f"SELECT p.category, ROUND(SUM(oi.sale_price), 2) AS gmv_usd "
+                f"FROM `{self._dataset_id}.order_items` oi "
+                f"JOIN `{self._dataset_id}.products` p ON oi.product_id = p.id "
+                f"WHERE oi.status != 'Cancelled' "
+                f"GROUP BY p.category ORDER BY gmv_usd DESC LIMIT 20"
+            )
         else:
             sql = (
                 f"SELECT p.category, p.department, COUNT(DISTINCT oi.order_id) AS orders_count, "
                 f"ROUND(SUM(oi.sale_price), 2) AS revenue_usd "
                 f"FROM `{self._dataset_id}.order_items` oi "
                 f"JOIN `{self._dataset_id}.products` p ON oi.product_id = p.id "
-                f"WHERE oi.status = 'Complete' "
+                f"WHERE oi.status NOT IN ('Cancelled', 'Returned') "
                 f"GROUP BY p.category, p.department ORDER BY revenue_usd DESC LIMIT 20"
             )
         return SQLPlan(
-            reasoning="Generated BigQuery StandardSQL query aligned with the available schema.",
+            reasoning="Generated BigQuery StandardSQL query aligned with the available schema and semantic glossary.",
             sql_query=sql,
             requires_sql=True,
             target_tables=["orders", "order_items", "products", "users"],
@@ -413,11 +446,25 @@ class LangChainRetailAgentAdapter:
         rows_preview = query_result.rows[:30] if query_result else []
         sql_used = query_result.sql_executed if query_result else "N/A (Metadata response)"
 
+        matched_metrics = self._glossary.detect_metrics(
+            user_message + " " + (query_result.sql_executed if query_result else "")
+        )
+        glossary_hint = (
+            f"\nRelevant Metric Definitions:\n{self._glossary.format_response_definitions(matched_metrics)}\n"
+            if matched_metrics
+            else ""
+        )
+
         system_prompt = (
             "You are an Executive Retail Strategy & Data Analyst.\n"
             f"CEO Dynamic Tone Instructions: {persona.tone_instructions}\n"
             f"User Formatting Preference: format={preferences.preferred_format.value}, depth={preferences.preferred_depth.value}\n"
             "STRICT PRIVACY RULE: Never output any PII (names, emails, street addresses, zip codes, coordinates).\n"
+            "METRIC DEFINITION RULE: If any standard retail metrics (e.g., Net Revenue, GMV, Churn Rate, Gross Margin, "
+            "Repeat Customer Rate, AOV) were calculated, you MUST list their exact formulas in `used_metric_definitions`. "
+            "Include a brief 'Metric Definitions Applied' section in the analysis stating the definition used and noting "
+            "that the user can override any definition in their prompt.\n"
+            f"{glossary_hint}"
             "Provide clear executive insights grounded strictly in the query data and concrete Q2/next-step action items."
         )
         prompt_body = (
@@ -444,6 +491,18 @@ class LangChainRetailAgentAdapter:
         persona: PersonaConfig,
         preferences: UserPreferenceProfile,
     ) -> AnalystSynthesis:
+        matched_metrics = self._glossary.detect_metrics(
+            user_message + " " + (query_result.sql_executed if query_result else "")
+        )
+        used_defs = [
+            f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in matched_metrics
+        ]
+        glossary_section = (
+            "\n\n" + self._glossary.format_response_definitions(matched_metrics)
+            if matched_metrics
+            else ""
+        )
+
         if query_result is None or not query_result.rows:
             return AnalystSynthesis(
                 executive_summary=(
@@ -454,12 +513,14 @@ class LangChainRetailAgentAdapter:
                     f"_Applied Tone: {persona.tone_instructions}_\n\n"
                     "You can analyze revenue trends by category/department, state-level customer spend, "
                     "cancellation/return churn drivers, and product margin performance."
+                    f"{glossary_section}"
                 ),
                 action_items=[
                     "Query monthly revenue and gross margin across top product categories.",
                     "Compare state-level repeat purchase and return rates to identify regional bottlenecks.",
                 ],
                 report_title="Dataset Capability Overview",
+                used_metric_definitions=used_defs,
             )
 
         rows = query_result.rows
@@ -481,11 +542,12 @@ class LangChainRetailAgentAdapter:
                 f"Analysis completed across {query_result.row_count} aggregated records "
                 f"(Tone: {persona.tone_instructions})."
             ),
-            detailed_analysis=f"### Key Findings\n{formatted_data}",
+            detailed_analysis=f"### Key Findings\n{formatted_data}{glossary_section}",
             action_items=[
                 "Prioritize inventory and marketing allocation toward highest-margin segments shown above.",
                 "Investigate elevated cancellation/return cohorts and deploy targeted retention offers.",
                 "Schedule automated weekly variance tracking on underperforming regions/categories.",
             ],
             report_title=f"Executive Retail Report: {user_message[:50]}",
+            used_metric_definitions=used_defs,
         )

@@ -86,6 +86,14 @@ class Settings(BaseSettings):
         default="https://cloud.langfuse.com", validation_alias="LANGFUSE_HOST"
     )
 
+    # Semantic Glossary & Retail Metric Defaults
+    enable_semantic_glossary: bool = Field(
+        default=True, validation_alias="ENABLE_SEMANTIC_GLOSSARY"
+    )
+    custom_metric_glossary: dict[str, str] = Field(
+        default_factory=dict, validation_alias="CUSTOM_METRIC_GLOSSARY"
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

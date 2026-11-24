@@ -35,6 +35,7 @@ from app.domain.models import (
     UserPreferenceProfile,
 )
 from app.domain.pii_masker import PIIMasker
+from app.domain.semantic_glossary import SemanticGlossary
 from app.domain.sql_policy import SQLPolicyEngine
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ class ChatOrchestratorService:
         cache_ttl_seconds: int = 300,
         chat_history_limit: int = 10,
         default_persona_tone: str = PersonaConfig().tone_instructions,
+        glossary: SemanticGlossary | None = None,
     ) -> None:
         self._llm = llm_agent
         self._warehouse = warehouse
@@ -87,6 +89,7 @@ class ChatOrchestratorService:
         self._max_sql_retries = max_sql_retries
         self._cache_ttl = cache_ttl_seconds
         self._chat_history_limit = chat_history_limit
+        self._glossary = glossary or SemanticGlossary()
         self._analysis_graph = self._build_analysis_graph()
 
     def _build_analysis_graph(self) -> CompiledStateGraph:
@@ -442,7 +445,24 @@ class ChatOrchestratorService:
 
         pii_redactions_total = workflow_state.get("redactions_count", 0)
 
+        used_metrics_list = list(synthesis.used_metric_definitions)
+        if not used_metrics_list:
+            detected = self._glossary.detect_metrics(
+                request.message + " " + (query_result.sql_executed if query_result else "")
+            )
+            used_metrics_list = [
+                f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in detected
+            ]
+
         combined_md = f"{synthesis.executive_summary}\n\n{synthesis.detailed_analysis}"
+        if used_metrics_list and "Metric Definitions Applied" not in combined_md:
+            detected_metrics = self._glossary.detect_metrics(
+                request.message + " " + (query_result.sql_executed if query_result else "")
+            )
+            defs_block = self._glossary.format_response_definitions(detected_metrics or None)
+            if defs_block:
+                combined_md += f"\n\n{defs_block}"
+
         if synthesis.action_items:
             actions_md = "\n".join(f"- {item}" for item in synthesis.action_items)
             combined_md += f"\n\n### Action Items\n{actions_md}"
@@ -470,6 +490,7 @@ class ChatOrchestratorService:
                     content_markdown=masked_reply,
                     action_items=masked_actions,
                     sql_used=safe_sql,
+                    metric_definitions=used_metrics_list,
                 )
             )
             saved_report_id = saved.report_id
@@ -488,6 +509,7 @@ class ChatOrchestratorService:
             data_preview=(query_result.rows[:10] if query_result else []),
             row_count=query_result.row_count if query_result else 0,
             saved_report_id=saved_report_id,
+            used_metric_definitions=used_metrics_list,
             observability={
                 "trace_id": trace_id,
                 "total_latency_ms": total_ms,
