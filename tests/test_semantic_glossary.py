@@ -276,11 +276,15 @@ def test_repeat_customer_calculation_logic() -> None:
     sql = plan.sql_query
 
     # P1: must calculate share of customers with >= 2 completed orders, not just unique buyers
-    assert "completed_orders >= 2" in sql
+    assert "COUNT(DISTINCT order_id) >= 2" in sql
     assert "repeat_customers" in sql
     assert "repeat_customer_rate_pct" in sql
     assert "total_customers" in sql
     assert "total_buyers" not in sql
+    assert "repeat_customers AS" in sql
+    assert "GROUP BY user_id, brand" in sql
+    assert "LEFT JOIN repeat_customers rc ON o.user_id = rc.user_id AND o.brand = rc.brand" in sql
+    assert "GROUP BY o.brand, o.category" in sql
 
 
 def test_repeat_customer_mock_query_output() -> None:

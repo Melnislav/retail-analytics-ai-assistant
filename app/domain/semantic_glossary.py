@@ -99,13 +99,15 @@ DEFAULT_METRICS: dict[str, MetricDefinition] = {
     "repeat_customer_rate": MetricDefinition(
         key="repeat_customer_rate",
         name="Repeat Customer Rate",
-        description="Percentage of active purchasers who have placed 2 or more completed orders.",
+        description=(
+            "Percentage of active purchasers who have placed 2 or more completed orders within the same brand."
+        ),
         sql_formula=(
             "ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN completed_orders >= 2 THEN user_id END), "
             "COUNT(DISTINCT user_id)) * 100, 2)"
         ),
         business_rule=(
-            "Evaluates customer retention and brand loyalty as share of customers with 2 or more completed orders."
+            "Evaluates brand loyalty as the share of customers with 2 or more completed orders within that brand."
         ),
         override_hint="Override example: 'define repeat customer as placed 3 or more orders'",
         keywords=[
