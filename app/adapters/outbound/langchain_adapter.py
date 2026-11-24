@@ -331,6 +331,8 @@ class LangChainRetailAgentAdapter:
         previous_sql: str | None = None,
     ) -> SQLPlan:
         retry_context = ""
+        if self._glossary.has_unsupported_configured_churn_scope(user_message):
+            return self._clarification_plan("unsupported_configured_churn_scope")
         if previous_error:
             retry_context = (
                 f"\n\nPREVIOUS ATTEMPT FAILED!\nFailed SQL:\n{previous_sql}\nError/Feedback: {previous_error}\n"
@@ -376,16 +378,9 @@ class LangChainRetailAgentAdapter:
         has_churn = "churn" in low or "отток" in low
         has_returns = any(word in low for word in ("return", "cancel", "возврат", "отмен"))
         if self._glossary.has_unsupported_cancelled_order_churn_override(user_message):
-            return SQLPlan(
-                reasoning="Cancelled orders are not a supported customer churn definition.",
-                sql_query="",
-                requires_sql=False,
-                response_message=(
-                    "I can't calculate customer churn as cancelled orders only because cancellations "
-                    "are a separate metric. Please define churn as no purchases for a number of days, "
-                    "or ask for the cancellation rate."
-                ),
-            )
+            return self._clarification_plan("unsupported_cancelled_order_churn_override")
+        if self._glossary.has_unsupported_configured_churn_scope(user_message):
+            return self._clarification_plan("unsupported_configured_churn_scope")
         if "schema" in low or "what tables" in low or "what data is available" in low:
             return SQLPlan(
                 reasoning="User asked for database schema metadata; no BigQuery execution required.",
@@ -538,6 +533,15 @@ class LangChainRetailAgentAdapter:
             sql_query=sql,
             requires_sql=True,
             target_tables=["orders", "order_items", "products", "users"],
+        )
+
+    def _clarification_plan(self, message_key: str) -> SQLPlan:
+        """Build a no-query response for a metric rule the application cannot apply safely."""
+        return SQLPlan(
+            reasoning="The requested metric definition cannot be applied safely.",
+            sql_query="",
+            requires_sql=False,
+            response_message=self._glossary.clarification_message(message_key),
         )
 
     async def synthesize_response(

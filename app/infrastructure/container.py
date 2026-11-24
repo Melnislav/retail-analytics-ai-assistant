@@ -41,6 +41,7 @@ class ApplicationContainer:
         self.glossary = SemanticGlossary(
             custom_definitions=settings.custom_metric_glossary,
             enabled=settings.enable_semantic_glossary,
+            clarification_messages=settings.metric_clarification_messages,
         )
         self.pii_masker = PIIMasker(salt=settings.pii_salt)
         self.sql_policy = SQLPolicyEngine(

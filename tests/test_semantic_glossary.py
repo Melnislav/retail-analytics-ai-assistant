@@ -194,6 +194,9 @@ async def test_end_to_end_chat_custom_metric_definition_override(tmp_path: Path)
         custom_metric_glossary={
             "churn_rate": "Churn defined as no orders in 45 days for VIP segments.",
         },
+        metric_clarification_messages={
+            "unsupported_configured_churn_scope": "VIP churn is unavailable. Use an unrestricted churn rule."
+        },
     )
     container = ApplicationContainer(test_settings)
     await container.startup()
@@ -213,13 +216,13 @@ async def test_end_to_end_chat_custom_metric_definition_override(tmp_path: Path)
         response = await container.chat_orchestrator.handle_message(
             ChatRequest(
                 session_id="test_glossary_override_sess",
-                message="Calculate churn rate defining churn as cancelled orders only",
+                message="Calculate customer churn rate",
             ),
             user,
         )
 
         assert response.reply
-        assert "cancellations are a separate metric" in response.reply
+        assert "VIP churn is unavailable" in response.reply
         assert response.data_preview == []
         assert response.used_metric_definitions == []
         assert "Metric Definitions Applied" not in response.reply
@@ -340,6 +343,24 @@ def test_fallback_rejects_cancelled_order_churn_override() -> None:
     assert plan.sql_query == ""
     assert plan.response_message is not None
     assert "cancellations are a separate metric" in plan.response_message
+
+
+def test_fallback_rejects_configured_churn_scope_with_configured_message() -> None:
+    clarification = "Churn audience filters are unavailable. Please use an unrestricted churn rule."
+    glossary = SemanticGlossary(
+        custom_definitions={
+            "churn_rate": "Customer churn defined as no orders placed in 45 days for VIP segments."
+        },
+        clarification_messages={"unsupported_configured_churn_scope": clarification},
+    )
+
+    plan = LangChainRetailAgentAdapter(glossary=glossary)._heuristic_sql_plan(
+        "Calculate customer churn rate"
+    )
+
+    assert plan.requires_sql is False
+    assert plan.sql_query == ""
+    assert plan.response_message == clarification
 
 
 def test_fallback_aov_uses_completed_orders() -> None:

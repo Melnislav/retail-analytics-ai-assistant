@@ -140,14 +140,36 @@ DEFAULT_METRICS: dict[str, MetricDefinition] = {
 }
 
 
+DEFAULT_METRIC_CLARIFICATION_MESSAGES: dict[str, str] = {
+    "unsupported_cancelled_order_churn_override": (
+        "I cannot calculate customer churn as cancelled orders only because cancellations are a "
+        "separate metric. Please define churn as no purchases for a number of days, or ask for "
+        "the cancellation rate."
+    ),
+    "unsupported_configured_churn_scope": (
+        "I cannot calculate customer churn for a restricted audience because the configured "
+        "audience filter is not supported. Please define churn as no purchases for a number of "
+        "days without an audience restriction."
+    ),
+}
+
+
 class SemanticGlossary:
     """Catalog of retail business metric definitions with prompt formatting and override support."""
 
     def __init__(
-        self, custom_definitions: dict[str, Any] | None = None, enabled: bool = True
+        self,
+        custom_definitions: dict[str, Any] | None = None,
+        enabled: bool = True,
+        clarification_messages: dict[str, str] | None = None,
     ) -> None:
         self._enabled = enabled
         self._metrics: dict[str, MetricDefinition] = dict(DEFAULT_METRICS)
+        self._clarification_messages = {
+            **DEFAULT_METRIC_CLARIFICATION_MESSAGES,
+            **(clarification_messages or {}),
+        }
+        self._custom_churn_definition: str | None = None
         if custom_definitions:
             for key, val in custom_definitions.items():
                 if isinstance(val, MetricDefinition):
@@ -158,6 +180,7 @@ class SemanticGlossary:
                     existing = self._metrics[key]
                     update: dict[str, str] = {"description": val, "business_rule": val}
                     if key == "churn_rate":
+                        self._custom_churn_definition = val
                         churn_days = self._extract_churn_days(val.lower())
                         if churn_days is not None:
                             update["sql_formula"] = (
@@ -270,6 +293,24 @@ class SemanticGlossary:
             )
         )
         return has_cancellation and explicit_override
+
+    def has_unsupported_configured_churn_scope(self, user_message: str) -> bool:
+        """Return whether a configured churn rule requires an unsupported audience filter."""
+        if not self._custom_churn_definition or not any(
+            term in user_message.lower() for term in ("churn", "отток")
+        ):
+            return False
+
+        return bool(
+            re.search(
+                r"\b(?:vip|segment(?:s)?|brand|category|region|state|country|store|channel)\b",
+                self._custom_churn_definition.lower(),
+            )
+        )
+
+    def clarification_message(self, key: str) -> str:
+        """Return a configured, English-language clarification message."""
+        return self._clarification_messages[key]
 
     @staticmethod
     def _includes_returns(text: str) -> bool:

@@ -135,6 +135,9 @@ class Settings(BaseSettings):
     custom_metric_glossary: dict[str, str] = Field(
         default_factory=dict, validation_alias="CUSTOM_METRIC_GLOSSARY"
     )
+    metric_clarification_messages: dict[str, str] = Field(
+        default_factory=dict, validation_alias="METRIC_CLARIFICATION_MESSAGES"
+    )
 
 
 @lru_cache(maxsize=1)
