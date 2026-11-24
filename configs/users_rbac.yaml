@@ -1,0 +1,21 @@
+users:
+  ceo:
+    user_id: "ceo_carol"
+    display_name: "Carol (Executive CEO)"
+    role: "ceo"
+    allowed_brands: []
+
+  brand_manager_alice:
+    user_id: "mgr_alice"
+    display_name: "Alice (Brand Manager - Calvin Klein)"
+    role: "brand_manager"
+    allowed_brands:
+      - "Calvin Klein"
+
+  brand_manager_bob:
+    user_id: "mgr_bob"
+    display_name: "Bob (Multi-Brand Manager)"
+    role: "brand_manager"
+    allowed_brands:
+      - "Diesel"
+      - "Tommy Hilfiger"
