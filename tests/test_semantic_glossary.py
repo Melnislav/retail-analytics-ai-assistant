@@ -310,6 +310,42 @@ def test_fallback_churn_uses_inactivity_not_cancellations() -> None:
     assert "COUNTIF(status IN ('Cancelled', 'Returned'))" not in sql
 
 
+def test_fallback_churn_uses_configured_threshold() -> None:
+    glossary = SemanticGlossary(
+        custom_definitions={
+            "churn_rate": "Customer churn defined strictly as no orders placed in 45 days.",
+        }
+    )
+    adapter = LangChainRetailAgentAdapter(glossary=glossary)
+
+    plan = adapter._heuristic_sql_plan("Calculate customer churn rate")
+
+    assert "TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 45 DAY)" in plan.sql_query
+
+
+def test_fallback_revenue_including_returns_uses_revenue_query() -> None:
+    adapter = LangChainRetailAgentAdapter()
+
+    plan = adapter._heuristic_sql_plan("Calculate revenue including returns")
+
+    assert "revenue_usd" in plan.sql_query
+    assert "oi.status != 'Cancelled'" in plan.sql_query
+    assert "return_cancel_rate_pct" not in plan.sql_query
+
+
+def test_fallback_return_query_is_not_reclassified_by_revenue_configuration() -> None:
+    glossary = SemanticGlossary(
+        custom_definitions={
+            "net_revenue": "Revenue includes returned items.",
+        }
+    )
+    adapter = LangChainRetailAgentAdapter(glossary=glossary)
+
+    plan = adapter._heuristic_sql_plan("Show return trend")
+
+    assert "return_cancel_rate_pct" in plan.sql_query
+
+
 def test_fallback_churn_mock_query_output() -> None:
     from app.adapters.outbound.bigquery_adapter import AsyncBigQueryAdapter
 

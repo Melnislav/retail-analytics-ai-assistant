@@ -198,8 +198,8 @@ class SemanticGlossary:
         """Extract user-specified churn inactivity days (e.g., 60 days)."""
         patterns = [
             r"interval\s+(\d+)\s+day",
-            r"(?:churn|отток|inactivity|покупок|purchase|purchases)[^\n.]{0,40}?(\d+)\s*(?:days?|дней|дня|дн)",
-            r"(\d+)\s*(?:days?|дней|дня|дн)[^\n.]{0,40}?(?:churn|отток|inactivity|покупок|purchase|purchases)",
+            r"(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)[^\n.]{0,40}?(\d+)\s*(?:days?|дней|дня|дн)",
+            r"(\d+)\s*(?:days?|дней|дня|дн)[^\n.]{0,40}?(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)",
             r"(?:churn|отток)[^\n.]{0,30}?(\d+)",
         ]
         for pat in patterns:
@@ -210,6 +210,59 @@ class SemanticGlossary:
                     if 0 < val <= 3650:
                         return val
         return None
+
+    def churn_inactivity_days(self, user_message: str) -> int:
+        """Resolve a user override or configured default churn threshold."""
+        user_override = self._extract_churn_days(user_message.lower())
+        if user_override is not None:
+            return user_override
+
+        churn_metric = self.get_metric("churn_rate")
+        if churn_metric is None:
+            return 90
+
+        configured_definition = " ".join(
+            [
+                churn_metric.description,
+                churn_metric.sql_formula,
+                churn_metric.business_rule,
+            ]
+        ).lower()
+        return self._extract_churn_days(configured_definition) or 90
+
+    @staticmethod
+    def _includes_returns(text: str) -> bool:
+        low = text.lower()
+        return any(
+            phrase in low
+            for phrase in [
+                "including return",
+                "include returned",
+                "includes returned",
+                "с возвратами",  # noqa: RUF001
+                "с учетом возвратов",  # noqa: RUF001
+            ]
+        )
+
+    def revenue_includes_returns(self, user_message: str) -> bool:
+        """Return whether the request or configured definition includes returned items."""
+        if not any(metric.key == "net_revenue" for metric in self.detect_metrics(user_message)):
+            return False
+        if self._includes_returns(user_message):
+            return True
+
+        revenue_metric = self.get_metric("net_revenue")
+        if revenue_metric is None:
+            return False
+        return self._includes_returns(
+            " ".join(
+                [
+                    revenue_metric.description,
+                    revenue_metric.sql_formula,
+                    revenue_metric.business_rule,
+                ]
+            )
+        )
 
     @staticmethod
     def _extract_repeat_threshold(low: str) -> int | None:
@@ -278,29 +331,20 @@ class SemanticGlossary:
                                 ),
                             }
                         )
-                elif metric.key == "net_revenue":
-                    if any(
-                        phrase in low
-                        for phrase in [
-                            "including return",
-                            "including returns",
-                            "с возвратами",  # noqa: RUF001
-                            "с учетом возвратов",  # noqa: RUF001
-                        ]
-                    ):
-                        resolved_metric = metric.model_copy(
-                            update={
-                                "name": "Revenue (Including Returns)",
-                                "description": (
-                                    "Total recognized revenue including returned items "
-                                    "(User custom rule: including returns)."
-                                ),
-                                "sql_formula": "SUM(sale_price) WHERE status != 'Cancelled'",
-                                "business_rule": (
-                                    "User-specified rule: includes returned items in revenue calculation."
-                                ),
-                            }
-                        )
+                elif metric.key == "net_revenue" and self._includes_returns(low):
+                    resolved_metric = metric.model_copy(
+                        update={
+                            "name": "Revenue (Including Returns)",
+                            "description": (
+                                "Total recognized revenue including returned items "
+                                "(User custom rule: including returns)."
+                            ),
+                            "sql_formula": "SUM(sale_price) WHERE status != 'Cancelled'",
+                            "business_rule": (
+                                "User-specified rule: includes returned items in revenue calculation."
+                            ),
+                        }
+                    )
                 matched.append(resolved_metric)
         return matched
 

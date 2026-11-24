@@ -390,15 +390,7 @@ class LangChainRetailAgentAdapter:
                 f"ORDER BY avg_spend_usd DESC LIMIT 20"
             )
         elif "churn" in low or "отток" in low:
-            churn_days = 90
-            detected = self._glossary.detect_metrics(user_message)
-            for m in detected:
-                if m.key == "churn_rate":
-                    cd = self._glossary._extract_churn_days(user_message.lower())
-                    if cd is not None:
-                        churn_days = cd
-                    break
-
+            churn_days = self._glossary.churn_inactivity_days(user_message)
             sql = (
                 f"WITH customer_activity AS (\n"
                 f"  SELECT user_id, MAX(created_at) AS last_order_at\n"
@@ -411,6 +403,15 @@ class LangChainRetailAgentAdapter:
                 f"  COUNT(DISTINCT CASE WHEN last_order_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {churn_days} DAY) THEN user_id END) AS churned_customers,\n"
                 f"  ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN last_order_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {churn_days} DAY) THEN user_id END), COUNT(DISTINCT user_id)) * 100, 2) AS churn_rate_pct\n"
                 f"FROM customer_activity"
+            )
+        elif self._glossary.revenue_includes_returns(user_message):
+            sql = (
+                f"SELECT p.category, p.department, COUNT(DISTINCT oi.order_id) AS orders_count, "
+                f"ROUND(SUM(oi.sale_price), 2) AS revenue_usd "
+                f"FROM `{self._dataset_id}.order_items` oi "
+                f"JOIN `{self._dataset_id}.products` p ON oi.product_id = p.id "
+                f"WHERE oi.status != 'Cancelled' "
+                f"GROUP BY p.category, p.department ORDER BY revenue_usd DESC LIMIT 20"
             )
         elif "return" in low or "cancel" in low or "возврат" in low or "отмен" in low:
             sql = (
