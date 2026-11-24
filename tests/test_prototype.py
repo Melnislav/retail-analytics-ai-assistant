@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.domain.models import UserContext, UserRole
+from app.adapters.outbound.langchain_adapter import LangChainRetailAgentAdapter, LLMProvider
+from app.domain.circuit_breaker import CircuitBreaker
+from app.domain.models import ChatMessage, GuardrailDecision, IntentType, UserContext, UserRole
 from app.domain.pii_masker import PIIMasker
 from app.domain.sql_policy import SQLPolicyEngine
 from app.infrastructure.config import Settings
@@ -37,6 +40,71 @@ def test_pii_masker_redacts_columns_and_text() -> None:
     masked_txt, txt_count = masker.mask_text("Contact john@example.com or 555-123-4567")
     assert txt_count == 2
     assert "john@example.com" not in masked_txt
+
+
+def test_pii_masker_redacts_sql_literals_and_exact_coordinates() -> None:
+    masker = PIIMasker()
+    text = (
+        "SELECT * FROM users WHERE first_name = 'Jane' "
+        "AND postal_code = '10001'; location 37.7749, -122.4194"
+    )
+
+    masked, count = masker.mask_text(text)
+
+    assert count >= 3
+    assert "Jane" not in masked
+    assert "10001" not in masked
+    assert "37.7749" not in masked
+    assert "-122.4194" not in masked
+    assert "[REDACTED_PII]" in masked
+    assert "[REDACTED_COORDINATES]" in masked
+
+
+@pytest.mark.asyncio
+async def test_langchain_boundary_masks_current_message_and_history() -> None:
+    adapter = LangChainRetailAgentAdapter()
+    structured_model = MagicMock()
+    structured_model.ainvoke = AsyncMock(
+        return_value=GuardrailDecision(intent=IntentType.DATA_ANALYSIS, is_safe=True)
+    )
+    model = MagicMock()
+    model.with_structured_output.return_value = structured_model
+    adapter._providers = [
+        LLMProvider(
+            name="test",
+            model=model,
+            circuit_breaker=CircuitBreaker("test"),
+        )
+    ]
+    history = [
+        ChatMessage(
+            role="user",
+            content="Contact jane@example.com at 742 Evergreen Terrace or 555-123-4567",
+        ),
+        ChatMessage(role="assistant", content="Compare revenue by brand."),
+    ]
+
+    decision = await adapter.classify_and_guard(
+        "Analyze first_name='Jane', postal_code='10001', coordinates: 37.7749, -122.4194",
+        history,
+    )
+
+    assert decision.is_safe is True
+    invocation = structured_model.ainvoke.await_args
+    assert invocation is not None
+    sent_messages = invocation.args[0]
+    sent_text = "\n".join(str(message.content) for message in sent_messages)
+    for pii_value in (
+        "jane@example.com",
+        "742 Evergreen Terrace",
+        "555-123-4567",
+        "Jane",
+        "10001",
+        "37.7749",
+        "-122.4194",
+    ):
+        assert pii_value not in sent_text
+    assert "Compare revenue by brand." in sent_text
 
 
 def test_sql_policy_blocks_mutations_and_enforces_product_rbac() -> None:

@@ -26,6 +26,7 @@ from app.domain.models import (
     UserContext,
     UserPreferenceProfile,
 )
+from app.domain.pii_masker import PIIMasker
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +58,12 @@ class LangChainRetailAgentAdapter:
         circuit_breaker_failure_threshold: int = 2,
         circuit_breaker_recovery_timeout: float = 60.0,
         dataset_id: str = "bigquery-public-data.thelook_ecommerce",
+        pii_masker: PIIMasker | None = None,
     ) -> None:
         self._dataset_id = dataset_id
         self._timeout_seconds = timeout_seconds
         self._primary_provider_name = provider.lower()
+        self._pii_masker = pii_masker or PIIMasker()
         self._providers: list[LLMProvider] = self._build_providers(
             provider=provider,
             google_api_key=google_api_key,
@@ -199,6 +202,8 @@ class LangChainRetailAgentAdapter:
         if not self._providers:
             return None
 
+        safe_messages = self._mask_messages(messages)
+
         for entry in self._providers:
             if not entry.circuit_breaker.can_execute():
                 logger.info(
@@ -212,7 +217,7 @@ class LangChainRetailAgentAdapter:
                 structured_model = entry.model.with_structured_output(schema)
                 # Hard deadline timeout wrapping (asyncio.wait_for)
                 result = await asyncio.wait_for(
-                    structured_model.ainvoke(messages),  # type: ignore[arg-type]
+                    structured_model.ainvoke(safe_messages),  # type: ignore[arg-type]
                     timeout=float(self._timeout_seconds),
                 )
                 entry.circuit_breaker.record_success()
@@ -239,6 +244,19 @@ class LangChainRetailAgentAdapter:
             task_name,
         )
         return None
+
+    def _mask_messages(
+        self,
+        messages: list[SystemMessage | HumanMessage | AIMessage],
+    ) -> list[SystemMessage | HumanMessage | AIMessage]:
+        """Enforce the no-PII-to-LLM invariant at the shared provider boundary."""
+        safe_messages: list[SystemMessage | HumanMessage | AIMessage] = []
+        for message in messages:
+            if not isinstance(message.content, str):
+                raise TypeError("Only text LLM messages are supported by the PII boundary.")
+            masked_content, _ = self._pii_masker.mask_text(message.content)
+            safe_messages.append(message.model_copy(update={"content": masked_content}))
+        return safe_messages
 
     @staticmethod
     def _format_history(history: list[ChatMessage]) -> list[HumanMessage | AIMessage]:

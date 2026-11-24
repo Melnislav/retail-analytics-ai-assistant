@@ -51,6 +51,13 @@ class ApplicationContainer:
             default_tone=settings.default_persona_tone,
         )
 
+        # Domain Policies
+        self.pii_masker = PIIMasker(salt=settings.pii_salt)
+        self.sql_policy = SQLPolicyEngine(
+            dataset_id=settings.bq_dataset_id,
+            default_limit=settings.default_row_limit,
+        )
+
         # Warehouse & LLM Adapters
         self.warehouse = AsyncBigQueryAdapter(
             project_id=settings.gcp_project_id or None,
@@ -75,13 +82,7 @@ class ApplicationContainer:
                 settings.circuit_breaker_recovery_timeout_seconds
             ),
             dataset_id=settings.bq_dataset_id,
-        )
-
-        # Domain Policies
-        self.pii_masker = PIIMasker(salt=settings.pii_salt)
-        self.sql_policy = SQLPolicyEngine(
-            dataset_id=settings.bq_dataset_id,
-            default_limit=settings.default_row_limit,
+            pii_masker=self.pii_masker,
         )
 
         # Application Services

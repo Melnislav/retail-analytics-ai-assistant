@@ -100,7 +100,9 @@ class ChatOrchestratorService:
 
         deleted_count = await self._reports.execute_confirmed_deletion(pending, user)
         titles_str = ", ".join(f"'{t}'" for t in pending.target_report_titles)
-        reply = f"Confirmed and executed: deleted {deleted_count} report(s) ({titles_str})."
+        reply = self._mask_text(
+            f"Confirmed and executed: deleted {deleted_count} report(s) ({titles_str})."
+        )
         await self._cache.append_chat_message(
             request.session_id, ChatMessage(role="assistant", content=reply)
         )
@@ -138,7 +140,7 @@ class ChatOrchestratorService:
             IntentType.BLOCKED_INJECTION,
         }:
             self._obs.increment_metric("guardrail_blocks_total")
-            refusal = (
+            refusal = self._mask_text(
                 decision.rejection_reason
                 or "I am an executive retail data analysis assistant and can only answer questions related to retail sales, customers, products, and saved reports."
             )
@@ -180,12 +182,20 @@ class ChatOrchestratorService:
                 )
                 return ChatResponse(session_id=request.session_id, trace_id=trace_id, reply=reply)
 
-            titles_bullets = "\n".join(f"- {t}" for t in pending.target_report_titles)
+            safe_pending = pending.model_copy(
+                update={
+                    "description": self._mask_text(pending.description),
+                    "target_report_titles": [
+                        self._mask_text(title) for title in pending.target_report_titles
+                    ],
+                }
+            )
+            titles_bullets = "\n".join(f"- {t}" for t in safe_pending.target_report_titles)
             reply = (
                 f"**Confirmation Required (Destructive Action)**\n"
-                f"{pending.description}\n\n"
+                f"{safe_pending.description}\n\n"
                 f"Matched reports:\n{titles_bullets}\n\n"
-                f"Please confirm using token `{pending.token}` (or approve in the prompt) before I permanently delete them."
+                f"Please confirm using token `{safe_pending.token}` (or approve in the prompt) before I permanently delete them."
             )
             await self._cache.append_chat_message(
                 request.session_id, ChatMessage(role="assistant", content=reply)
@@ -194,7 +204,7 @@ class ChatOrchestratorService:
                 session_id=request.session_id,
                 trace_id=trace_id,
                 reply=reply,
-                pending_confirmation=pending,
+                pending_confirmation=safe_pending,
                 observability={"trace_id": trace_id, "awaiting_confirmation": True},
             )
 
@@ -208,7 +218,7 @@ class ChatOrchestratorService:
                     f"- **{r.title}** (`{r.report_id[:8]}...`, {r.created_at.strftime('%Y-%m-%d %H:%M UTC')})"
                     for r in reports
                 ]
-                reply = "Here are your saved reports:\n" + "\n".join(lines)
+                reply = self._mask_text("Here are your saved reports:\n" + "\n".join(lines))
             await self._cache.append_chat_message(
                 request.session_id, ChatMessage(role="assistant", content=reply)
             )
@@ -273,9 +283,12 @@ class ChatOrchestratorService:
             cache_key = f"bq_cache:{sql_hash}"
             cached_payload = await self._cache.get_json(cache_key)
             if cached_payload is not None:
-                query_result = QueryExecutionResult(
+                cached_result = QueryExecutionResult(
                     **cached_payload, from_cache=True, attempts=attempt
                 )
+                masked_rows, row_redactions = self._masker.mask_rows(cached_result.rows)
+                pii_redactions_total += row_redactions
+                query_result = cached_result.model_copy(update={"rows": masked_rows})
                 self._obs.increment_metric("bq_cache_hits")
                 break
 
@@ -357,7 +370,10 @@ class ChatOrchestratorService:
         # 8. Optional Report Persistence
         saved_report_id: str | None = None
         if request.save_report or decision.should_save_report:
-            report_title = synthesis.report_title or f"Retail Analysis: {request.message[:60]}"
+            report_title = self._mask_text(
+                synthesis.report_title or f"Retail Analysis: {request.message[:60]}"
+            )
+            safe_sql = self._mask_text(query_result.sql_executed) if query_result else None
             saved = await self._reports.save_report(
                 SavedReport(
                     owner_user_id=user.user_id,
@@ -366,7 +382,7 @@ class ChatOrchestratorService:
                     summary=self._masker.mask_text(synthesis.executive_summary)[0],
                     content_markdown=masked_reply,
                     action_items=masked_actions,
-                    sql_used=query_result.sql_executed if query_result else None,
+                    sql_used=safe_sql,
                 )
             )
             saved_report_id = saved.report_id
@@ -381,7 +397,7 @@ class ChatOrchestratorService:
             trace_id=trace_id,
             reply=masked_reply,
             action_items=masked_actions,
-            sql_used=query_result.sql_executed if query_result else None,
+            sql_used=self._mask_text(query_result.sql_executed) if query_result else None,
             data_preview=(query_result.rows[:10] if query_result else []),
             row_count=query_result.row_count if query_result else 0,
             saved_report_id=saved_report_id,
@@ -394,3 +410,7 @@ class ChatOrchestratorService:
                 "golden_trios_used": len(golden_trios),
             },
         )
+
+    def _mask_text(self, text: str) -> str:
+        """Return text safe for persistence in reports or exposure to a user."""
+        return self._masker.mask_text(text)[0]

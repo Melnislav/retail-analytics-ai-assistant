@@ -22,6 +22,8 @@ SENSITIVE_COLUMN_NAMES = frozenset(
         "zipcode",
         "latitude",
         "longitude",
+        "user_geom",
+        "coordinates",
         "ip_address",
         "phone",
         "phone_number",
@@ -36,7 +38,22 @@ EMAIL_REGEX = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE_REGEX = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b")
 IPV4_REGEX = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 STREET_REGEX = re.compile(
-    r"\b\d{1,6}\s+[A-Za-z0-9\s]{2,35}\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct)\b",
+    r"\b\d{1,6}\s+[A-Za-z0-9\s]{2,35}\s+"
+    r"(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|"
+    r"Court|Ct|Terrace|Ter|Parkway|Pkwy|Place|Pl|Highway|Hwy|Circle|Cir|Trail|Trl)\b",
+    re.IGNORECASE,
+)
+COORDINATE_PAIR_REGEX = re.compile(
+    r"(?<![\d.])[-+]?(?:[1-8]?\d\.\d{3,}|90\.0{3,})\s*[,;]\s*"
+    r"[-+]?(?:1[0-7]\d\.\d{3,}|[1-9]?\d\.\d{3,}|180\.0{3,})(?![\d.])"
+)
+LABELED_PII_REGEX = re.compile(
+    r"(?P<label>\b(?:first[_\s-]?name|last[_\s-]?name|full[_\s-]?name|"
+    r"e-?mail|street[_\s-]?address|address|postal[_\s-]?code|zip(?:code)?|"
+    r"latitude|longitude|user[_\s-]?geom|coordinates|phone(?:[_\s-]?number)?|"
+    r"ip[_\s-]?address)\b"
+    r"[`\"']?\s*(?:=|:|\bis\b|\blike\b)\s*)"
+    r"(?P<value>(?:\[[A-Z_]+\]|\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\r\n)\]}]+))",
     re.IGNORECASE,
 )
 
@@ -52,7 +69,7 @@ class PIIMasker:
         return f"CUST_{digest.upper()}"
 
     def mask_text(self, text: str) -> tuple[str, int]:
-        """Scrubs emails, phone numbers, IPv4 addresses, and street addresses from text."""
+        """Scrub known PII values from free text before external or user-facing use."""
         if not text:
             return text, 0
 
@@ -68,6 +85,14 @@ class PIIMasker:
         masked = _count_sub(PHONE_REGEX, "[REDACTED_PHONE]", masked)
         masked = _count_sub(IPV4_REGEX, "[REDACTED_IP]", masked)
         masked = _count_sub(STREET_REGEX, "[REDACTED_ADDRESS]", masked)
+        masked = _count_sub(COORDINATE_PAIR_REGEX, "[REDACTED_COORDINATES]", masked)
+
+        def _replace_labeled(match: re.Match[str]) -> str:
+            nonlocal redactions
+            redactions += 1
+            return f"{match.group('label')}[REDACTED_PII]"
+
+        masked = LABELED_PII_REGEX.sub(_replace_labeled, masked)
         return masked, redactions
 
     def mask_rows(self, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
