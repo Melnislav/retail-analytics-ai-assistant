@@ -3,9 +3,51 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
+import yaml
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def load_user_rbac_profiles(
+    config_path: str | Path = "configs/users_rbac.yaml",
+) -> dict[str, dict[str, Any]]:
+    """Load local user RBAC and brand mapping profiles.
+
+    Falls back to sensible built-in defaults if the file does not exist.
+    """
+    path = Path(config_path)
+    if path.is_file():
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+                if isinstance(data, dict) and "users" in data and isinstance(data["users"], dict):
+                    return data["users"]
+        except Exception:
+            pass
+
+    return {
+        "ceo": {
+            "user_id": "ceo_carol",
+            "display_name": "Carol (Executive CEO)",
+            "role": "ceo",
+            "allowed_brands": [],
+        },
+        "brand_manager_alice": {
+            "user_id": "mgr_alice",
+            "display_name": "Alice (Brand Manager - Calvin Klein)",
+            "role": "brand_manager",
+            "allowed_brands": ["Calvin Klein"],
+        },
+        "brand_manager_bob": {
+            "user_id": "mgr_bob",
+            "display_name": "Bob (Multi-Brand Manager)",
+            "role": "brand_manager",
+            "allowed_brands": ["Diesel", "Tommy Hilfiger"],
+        },
+    }
 
 
 class Settings(BaseSettings):
@@ -17,7 +59,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = Field(
-        default="OpsFleet Retail Data Analysis Assistant", validation_alias="APP_NAME"
+        default="Retail Data Analysis Assistant", validation_alias="APP_NAME"
     )
     app_env: str = Field(default="production", validation_alias="APP_ENV")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
@@ -51,7 +93,7 @@ class Settings(BaseSettings):
 
     # Database & Redis
     database_url: str = Field(
-        default="sqlite+aiosqlite:///./opsfleet_local.db", validation_alias="DATABASE_URL"
+        default="sqlite+aiosqlite:///./retail_local.db", validation_alias="DATABASE_URL"
     )
     redis_url: str = Field(default="redis://localhost:6379/0", validation_alias="REDIS_URL")
     confirmation_ttl_seconds: int = Field(default=600, validation_alias="CONFIRMATION_TTL_SECONDS")
@@ -72,7 +114,7 @@ class Settings(BaseSettings):
         default=86400, validation_alias="CHAT_HISTORY_TTL_SECONDS"
     )
     # Data Protection & PII
-    pii_salt: str = Field(default="opsfleet-pii-salt-2026", validation_alias="PII_SALT")
+    pii_salt: str = Field(default="retail-pii-salt-2026", validation_alias="PII_SALT")
     demographic_min_group_size: int = Field(
         default=5,
         ge=2,
@@ -84,6 +126,17 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = Field(default="", validation_alias="LANGFUSE_SECRET_KEY")
     langfuse_host: str = Field(
         default="https://cloud.langfuse.com", validation_alias="LANGFUSE_HOST"
+    )
+
+    # Semantic Glossary & Retail Metric Defaults
+    enable_semantic_glossary: bool = Field(
+        default=True, validation_alias="ENABLE_SEMANTIC_GLOSSARY"
+    )
+    custom_metric_glossary: dict[str, str] = Field(
+        default_factory=dict, validation_alias="CUSTOM_METRIC_GLOSSARY"
+    )
+    metric_clarification_messages: dict[str, str] = Field(
+        default_factory=dict, validation_alias="METRIC_CLARIFICATION_MESSAGES"
     )
 
 

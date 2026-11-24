@@ -12,6 +12,7 @@ from app.adapters.outbound.redis_and_telemetry import (
 from app.application.chat_orchestrator import ChatOrchestratorService
 from app.application.report_service import ReportService
 from app.domain.pii_masker import PIIMasker
+from app.domain.semantic_glossary import SemanticGlossary
 from app.domain.sql_policy import SQLPolicyEngine
 from app.infrastructure.config import Settings
 
@@ -36,7 +37,12 @@ class ApplicationContainer:
         # Only saved reports require prototype persistence.
         self.report_repo = PostgresReportRepository(self.db_manager.session_factory)
 
-        # Domain Policies
+        # Domain Policies & Semantic Glossary
+        self.glossary = SemanticGlossary(
+            custom_definitions=settings.custom_metric_glossary,
+            enabled=settings.enable_semantic_glossary,
+            clarification_messages=settings.metric_clarification_messages,
+        )
         self.pii_masker = PIIMasker(salt=settings.pii_salt)
         self.sql_policy = SQLPolicyEngine(
             dataset_id=settings.bq_dataset_id,
@@ -66,6 +72,7 @@ class ApplicationContainer:
             dataset_id=settings.bq_dataset_id,
             demographic_min_group_size=settings.demographic_min_group_size,
             pii_masker=self.pii_masker,
+            glossary=self.glossary,
         )
 
         # Application Services
@@ -87,6 +94,7 @@ class ApplicationContainer:
             cache_ttl_seconds=settings.cache_ttl_seconds,
             chat_history_limit=settings.chat_history_limit,
             default_persona_tone=settings.default_persona_tone,
+            glossary=self.glossary,
         )
 
     async def startup(self) -> None:

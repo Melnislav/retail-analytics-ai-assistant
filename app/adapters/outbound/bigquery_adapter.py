@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import re
 from typing import Any
 
 import pandas as pd
@@ -331,28 +333,112 @@ class AsyncBigQueryAdapter:
                     "return_rate_pct": 13.7,
                 },
             ]
-        elif "CHURN" in q_upper or "RETURN" in q_upper or "CANCEL" in q_upper:
+        elif "CHURN" in q_upper or "CHURNED_CUSTOMERS" in q_upper:
+            days = 90
+            m_days = re.search(r"INTERVAL\s+(\d+)\s+DAY", q_upper) or re.search(
+                r"(\d+)\s*DAY", q_upper
+            )
+            if m_days:
+                with contextlib.suppress(ValueError):
+                    days = int(m_days.group(1))
+            elif "60" in q_upper:
+                days = 60
+
+            churned = 3480 if days <= 60 else (2610 if days == 90 else int(14500 * (days / 365.0)))
+            rate = round((churned / 14500.0) * 100, 2)
+            rows = [
+                {
+                    "total_active_customers": 14500,
+                    "churned_customers": churned,
+                    "churn_rate_pct": rate,
+                    "inactivity_period_days": days,
+                }
+            ]
+            if "RETURN_TREND" in q_upper:
+                rows = [
+                    {
+                        "month": "2026-08",
+                        "completed_orders": 6120,
+                        "cancelled_orders": 740,
+                        "returned_orders": 610,
+                        "return_cancel_rate_pct": 18.1,
+                        **rows[0],
+                    },
+                    {
+                        "month": "2026-09",
+                        "completed_orders": 6340,
+                        "cancelled_orders": 790,
+                        "returned_orders": 645,
+                        "return_cancel_rate_pct": 18.5,
+                        **rows[0],
+                    },
+                    {
+                        "month": "2026-10",
+                        "completed_orders": 5890,
+                        "cancelled_orders": 1180,
+                        "returned_orders": 890,
+                        "return_cancel_rate_pct": 26.0,
+                        **rows[0],
+                    },
+                ]
+        elif "REPEAT" in q_upper:
+            min_orders = 2
+            m_orders = re.search(
+                r"(?:COMPLETED_ORDERS|COUNT\(DISTINCT\s+ORDER_ID\))\s*>=\s*(\d+)", q_upper
+            )
+            if m_orders:
+                with contextlib.suppress(ValueError):
+                    min_orders = int(m_orders.group(1))
+
+            factor = 0.6 if min_orders >= 3 else 1.0
+            rows = [
+                {
+                    "category": "Jeans",
+                    "total_customers": 4250,
+                    "repeat_customers": int(1480 * factor),
+                    "repeat_customer_rate_pct": round((1480 * factor / 4250) * 100, 2),
+                },
+                {
+                    "category": "Tops & Tees",
+                    "total_customers": 5100,
+                    "repeat_customers": int(1620 * factor),
+                    "repeat_customer_rate_pct": round((1620 * factor / 5100) * 100, 2),
+                },
+                {
+                    "category": "Outerwear & Coats",
+                    "total_customers": 3800,
+                    "repeat_customers": int(950 * factor),
+                    "repeat_customer_rate_pct": round((950 * factor / 3800) * 100, 2),
+                },
+                {
+                    "category": "Active",
+                    "total_customers": 3200,
+                    "repeat_customers": int(760 * factor),
+                    "repeat_customer_rate_pct": round((760 * factor / 3200) * 100, 2),
+                },
+            ]
+        elif "RETURN" in q_upper or "CANCEL" in q_upper:
             rows = [
                 {
                     "month": "2026-08",
                     "completed_orders": 6120,
                     "cancelled_orders": 740,
                     "returned_orders": 610,
-                    "churn_rate_pct": 18.1,
+                    "cancellation_return_rate_pct": 18.1,
                 },
                 {
                     "month": "2026-09",
                     "completed_orders": 6340,
                     "cancelled_orders": 790,
                     "returned_orders": 645,
-                    "churn_rate_pct": 18.5,
+                    "cancellation_return_rate_pct": 18.5,
                 },
                 {
                     "month": "2026-10",
                     "completed_orders": 5890,
                     "cancelled_orders": 1180,
                     "returned_orders": 890,
-                    "churn_rate_pct": 26.0,
+                    "cancellation_return_rate_pct": 26.0,
                 },
             ]
         elif "USERS" in q_upper and "EMAIL" in q_upper:

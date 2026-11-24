@@ -61,7 +61,7 @@ LABELED_PII_REGEX = re.compile(
 class PIIMasker:
     """Enforces zero-PII leakage across tabular results and natural-language outputs."""
 
-    def __init__(self, salt: str = "opsfleet-pii-salt-2026") -> None:
+    def __init__(self, salt: str = "retail-pii-salt-2026") -> None:
         self._salt = salt
 
     def pseudonymize_id(self, raw_id: Any) -> str:

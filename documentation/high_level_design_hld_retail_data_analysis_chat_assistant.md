@@ -423,8 +423,8 @@ Tracks individual presentation preferences using a dedicated domain aggregate:
 class UserPreferences:
     user_id: str
     preferred_format: str  # "table" | "bullet_points" | "narrative"
-    analysis_depth: str    # "executive_summary" | "deep_dive"
-    tone_preference: str   # "concise" | "detailed"
+    analysis_depth: str  # "executive_summary" | "deep_dive"
+    tone_preference: str  # "concise" | "detailed"
     auto_chart_enabled: bool
 ```
 * **Proactive Preference Confirmation ("2-Repeat Rule"):** If a user explicitly requests a format change twice in a single conversation (e.g., *"Show this as a table"*), the agent presents a single-click confirmation asking: *"Would you like me to set 'Table format' as your default preference for future sessions?"*.

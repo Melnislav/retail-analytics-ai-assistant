@@ -1,33 +1,33 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: opsfleet-postgres
+    container_name: retail-postgres
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-opsfleet}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-opsfleet_secret_pass}
-      POSTGRES_DB: ${POSTGRES_DB:-opsfleet_assistant}
+      POSTGRES_USER: ${POSTGRES_USER:-retail}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-retail_secret_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-retail_assistant}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - opsfleet_pgdata:/var/lib/postgresql/data
+      - retail_pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-opsfleet} -d ${POSTGRES_DB:-opsfleet_assistant} -p 5432"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-retail} -d ${POSTGRES_DB:-retail_assistant} -p 5432"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   redis:
     image: redis:7-alpine
-    container_name: opsfleet-redis
+    container_name: retail-redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
-      - opsfleet_redisdata:/data
+      - retail_redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -38,12 +38,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: opsfleet-api
+    container_name: retail-api
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-opsfleet}:${POSTGRES_PASSWORD:-opsfleet_secret_pass}@postgres:5432/${POSTGRES_DB:-opsfleet_assistant}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-retail}:${POSTGRES_PASSWORD:-retail_secret_pass}@postgres:5432/${POSTGRES_DB:-retail_assistant}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     ports:
       - "${API_PORT:-8000}:${API_PORT:-8000}"
@@ -62,7 +62,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: opsfleet-cli
+    container_name: retail-cli
     profiles:
       - cli
     env_file:
@@ -77,5 +77,5 @@ services:
     command: ["python", "-m", "app.adapters.inbound.cli_client"]
 
 volumes:
-  opsfleet_pgdata:
-  opsfleet_redisdata:
+  retail_pgdata:
+  retail_redisdata:

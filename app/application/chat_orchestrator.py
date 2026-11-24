@@ -35,6 +35,7 @@ from app.domain.models import (
     UserPreferenceProfile,
 )
 from app.domain.pii_masker import PIIMasker
+from app.domain.semantic_glossary import SemanticGlossary
 from app.domain.sql_policy import SQLPolicyEngine
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ class ChatOrchestratorService:
         cache_ttl_seconds: int = 300,
         chat_history_limit: int = 10,
         default_persona_tone: str = PersonaConfig().tone_instructions,
+        glossary: SemanticGlossary | None = None,
     ) -> None:
         self._llm = llm_agent
         self._warehouse = warehouse
@@ -87,6 +89,7 @@ class ChatOrchestratorService:
         self._max_sql_retries = max_sql_retries
         self._cache_ttl = cache_ttl_seconds
         self._chat_history_limit = chat_history_limit
+        self._glossary = glossary or SemanticGlossary()
         self._analysis_graph = self._build_analysis_graph()
 
     def _build_analysis_graph(self) -> CompiledStateGraph:
@@ -118,6 +121,7 @@ class ChatOrchestratorService:
             if plan is None or not plan.requires_sql:
                 return {"query_result": None}
 
+            applied_defs = list(plan.applied_metric_definitions) if plan else []
             attempt = state.get("attempt", 1)
             trace_id = state.get("trace_id", "")
             user = state["user_context"]
@@ -145,6 +149,10 @@ class ChatOrchestratorService:
                 cached_result = QueryExecutionResult(
                     **cached_payload, from_cache=True, attempts=attempt
                 )
+                if applied_defs and not cached_result.applied_metric_definitions:
+                    cached_result = cached_result.model_copy(
+                        update={"applied_metric_definitions": applied_defs}
+                    )
                 masked_rows, row_redactions = self._masker.mask_rows(cached_result.rows)
                 self._obs.increment_metric("bq_cache_hits")
                 return {
@@ -185,6 +193,7 @@ class ChatOrchestratorService:
                     bytes_processed=raw_result.bytes_processed,
                     from_cache=False,
                     attempts=attempt,
+                    applied_metric_definitions=applied_defs,
                 )
                 await self._cache.set_json(
                     cache_key,
@@ -218,13 +227,20 @@ class ChatOrchestratorService:
         async def synthesize_node(state: AnalysisWorkflowState) -> dict[str, Any]:
             t_syn = time.perf_counter()
             trace_id = state.get("trace_id", "")
-            synthesis = await self._llm.synthesize_response(
-                user_message=state["user_message"],
-                query_result=state.get("query_result"),
-                persona=self._persona,
-                preferences=state["preferences"],
-                history=state["history"],
-            )
+            plan = state.get("sql_plan")
+            if plan and plan.response_message:
+                synthesis = AnalystSynthesis(
+                    executive_summary=plan.response_message,
+                    detailed_analysis="",
+                )
+            else:
+                synthesis = await self._llm.synthesize_response(
+                    user_message=state["user_message"],
+                    query_result=state.get("query_result"),
+                    persona=self._persona,
+                    preferences=state["preferences"],
+                    history=state["history"],
+                )
             if trace_id:
                 self._obs.record_span(
                     trace_id,
@@ -442,7 +458,32 @@ class ChatOrchestratorService:
 
         pii_redactions_total = workflow_state.get("redactions_count", 0)
 
+        plan = workflow_state.get("sql_plan")
+        has_clarification = bool(plan and plan.response_message)
+        used_metrics_list = [] if has_clarification else list(synthesis.used_metric_definitions)
+        if (
+            not has_clarification
+            and not used_metrics_list
+            and query_result
+            and query_result.applied_metric_definitions
+        ):
+            used_metrics_list = list(query_result.applied_metric_definitions)
+        if not has_clarification and not used_metrics_list:
+            detected = self._glossary.detect_metrics(
+                request.message + " " + (query_result.sql_executed if query_result else "")
+            )
+            used_metrics_list = [
+                f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in detected
+            ]
         combined_md = f"{synthesis.executive_summary}\n\n{synthesis.detailed_analysis}"
+        if used_metrics_list and "Metric Definitions Applied" not in combined_md:
+            detected_metrics = self._glossary.detect_metrics(
+                request.message + " " + (query_result.sql_executed if query_result else "")
+            )
+            defs_block = self._glossary.format_response_definitions(detected_metrics or None)
+            if defs_block:
+                combined_md += f"\n\n{defs_block}"
+
         if synthesis.action_items:
             actions_md = "\n".join(f"- {item}" for item in synthesis.action_items)
             combined_md += f"\n\n### Action Items\n{actions_md}"
@@ -470,6 +511,7 @@ class ChatOrchestratorService:
                     content_markdown=masked_reply,
                     action_items=masked_actions,
                     sql_used=safe_sql,
+                    metric_definitions=used_metrics_list,
                 )
             )
             saved_report_id = saved.report_id
@@ -488,6 +530,7 @@ class ChatOrchestratorService:
             data_preview=(query_result.rows[:10] if query_result else []),
             row_count=query_result.row_count if query_result else 0,
             saved_report_id=saved_report_id,
+            used_metric_definitions=used_metrics_list,
             observability={
                 "trace_id": trace_id,
                 "total_latency_ms": total_ms,

@@ -1,4 +1,9 @@
-"""Pydantic v2 BaseSettings configuration loaded from .env."""
+"""Single source of truth configuration re-export.
+
+Canonical configuration models reside in app.infrastructure.config.
+This module re-exports Settings and get_settings to maintain backward
+compatibility for root-level entry points without duplicating definitions.
+"""
 
 from __future__ import annotations
 
