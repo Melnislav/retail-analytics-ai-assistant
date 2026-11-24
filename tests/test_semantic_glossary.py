@@ -219,8 +219,10 @@ async def test_end_to_end_chat_custom_metric_definition_override(tmp_path: Path)
         )
 
         assert response.reply
-        assert len(response.used_metric_definitions) > 0
-        assert "### Metric Definitions Applied" in response.reply
+        assert "cancellations are a separate metric" in response.reply
+        assert response.data_preview == []
+        assert response.used_metric_definitions == []
+        assert "Metric Definitions Applied" not in response.reply
     finally:
         await container.shutdown()
 
@@ -325,6 +327,19 @@ def test_fallback_churn_uses_configured_threshold() -> None:
 
     plan = adapter._heuristic_sql_plan("Calculate customer churn rate")
     assert "TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 45 DAY)" in plan.sql_query
+
+
+def test_fallback_rejects_cancelled_order_churn_override() -> None:
+    adapter = LangChainRetailAgentAdapter()
+
+    plan = adapter._heuristic_sql_plan(
+        "Calculate churn rate defining churn as cancelled orders only"
+    )
+
+    assert plan.requires_sql is False
+    assert plan.sql_query == ""
+    assert plan.response_message is not None
+    assert "cancellations are a separate metric" in plan.response_message
 
 
 def test_fallback_aov_uses_completed_orders() -> None:

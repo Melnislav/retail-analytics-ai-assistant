@@ -375,6 +375,17 @@ class LangChainRetailAgentAdapter:
         low = user_message.lower()
         has_churn = "churn" in low or "отток" in low
         has_returns = any(word in low for word in ("return", "cancel", "возврат", "отмен"))
+        if self._glossary.has_unsupported_cancelled_order_churn_override(user_message):
+            return SQLPlan(
+                reasoning="Cancelled orders are not a supported customer churn definition.",
+                sql_query="",
+                requires_sql=False,
+                response_message=(
+                    "I can't calculate customer churn as cancelled orders only because cancellations "
+                    "are a separate metric. Please define churn as no purchases for a number of days, "
+                    "or ask for the cancellation rate."
+                ),
+            )
         if "schema" in low or "what tables" in low or "what data is available" in low:
             return SQLPlan(
                 reasoning="User asked for database schema metadata; no BigQuery execution required.",

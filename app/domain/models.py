@@ -117,6 +117,10 @@ class SQLPlan(BaseModel):
         default=True,
         description="False if question can be answered directly from metadata/history without querying BQ.",
     )
+    response_message: str | None = Field(
+        default=None,
+        description="User-facing clarification when no query should be executed.",
+    )
     target_tables: list[str] = Field(default_factory=list)
     applied_metric_definitions: list[str] = Field(
         default_factory=list,

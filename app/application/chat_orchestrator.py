@@ -227,13 +227,20 @@ class ChatOrchestratorService:
         async def synthesize_node(state: AnalysisWorkflowState) -> dict[str, Any]:
             t_syn = time.perf_counter()
             trace_id = state.get("trace_id", "")
-            synthesis = await self._llm.synthesize_response(
-                user_message=state["user_message"],
-                query_result=state.get("query_result"),
-                persona=self._persona,
-                preferences=state["preferences"],
-                history=state["history"],
-            )
+            plan = state.get("sql_plan")
+            if plan and plan.response_message:
+                synthesis = AnalystSynthesis(
+                    executive_summary=plan.response_message,
+                    detailed_analysis="",
+                )
+            else:
+                synthesis = await self._llm.synthesize_response(
+                    user_message=state["user_message"],
+                    query_result=state.get("query_result"),
+                    persona=self._persona,
+                    preferences=state["preferences"],
+                    history=state["history"],
+                )
             if trace_id:
                 self._obs.record_span(
                     trace_id,
@@ -451,17 +458,23 @@ class ChatOrchestratorService:
 
         pii_redactions_total = workflow_state.get("redactions_count", 0)
 
-        used_metrics_list = list(synthesis.used_metric_definitions)
-        if not used_metrics_list and query_result and query_result.applied_metric_definitions:
+        plan = workflow_state.get("sql_plan")
+        has_clarification = bool(plan and plan.response_message)
+        used_metrics_list = [] if has_clarification else list(synthesis.used_metric_definitions)
+        if (
+            not has_clarification
+            and not used_metrics_list
+            and query_result
+            and query_result.applied_metric_definitions
+        ):
             used_metrics_list = list(query_result.applied_metric_definitions)
-        if not used_metrics_list:
+        if not has_clarification and not used_metrics_list:
             detected = self._glossary.detect_metrics(
                 request.message + " " + (query_result.sql_executed if query_result else "")
             )
             used_metrics_list = [
                 f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in detected
             ]
-
         combined_md = f"{synthesis.executive_summary}\n\n{synthesis.detailed_analysis}"
         if used_metrics_list and "Metric Definitions Applied" not in combined_md:
             detected_metrics = self._glossary.detect_metrics(

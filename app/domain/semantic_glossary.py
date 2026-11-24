@@ -253,6 +253,25 @@ class SemanticGlossary:
         return self._extract_churn_days(configured_definition) or 90
 
     @staticmethod
+    def has_unsupported_cancelled_order_churn_override(user_message: str) -> bool:
+        """Return whether the request defines customer churn by cancelled orders."""
+        low = user_message.lower()
+        if not ("churn" in low or "отток" in low):
+            return False
+
+        has_cancellation = any(term in low for term in ("cancel", "отмен"))
+        explicit_override = bool(
+            re.search(
+                r"(?:define|defined|defining|treat|consider)\s+(?:customer\s+)?churn|"
+                r"(?:customer\s+)?churn\s+(?:as|from|using|is)|"
+                r"(?:считать|определ\w*)[^.\n]{0,50}(?:отток|churn)|"
+                r"(?:отток|churn)[^.\n]{0,50}(?:считать|определ\w*)",
+                low,
+            )
+        )
+        return has_cancellation and explicit_override
+
+    @staticmethod
     def _includes_returns(text: str) -> bool:
         low = text.lower()
         return any(
