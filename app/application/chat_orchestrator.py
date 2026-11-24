@@ -1,4 +1,4 @@
-"""Core async orchestration service connecting Guardrails, Golden Bucket, SQL Self-Correction, PII Masking, and Synthesis."""
+"""Core prototype orchestration for guardrails, SQL, PII masking, and reports."""
 
 from __future__ import annotations
 
@@ -11,11 +11,8 @@ from app.application.ports import (
     AnalyticsWarehousePort,
     CachePort,
     ConfirmationStorePort,
-    GoldenKnowledgePort,
     LLMAgentPort,
     ObservabilityPort,
-    PersonaStorePort,
-    UserPreferencePort,
 )
 from app.application.report_service import ReportService
 from app.domain.exceptions import QueryExecutionError, SQLSafetyError
@@ -25,9 +22,11 @@ from app.domain.models import (
     ChatResponse,
     ConfirmationRequest,
     IntentType,
+    PersonaConfig,
     QueryExecutionResult,
     SavedReport,
     UserContext,
+    UserPreferenceProfile,
 )
 from app.domain.pii_masker import PIIMasker
 from app.domain.sql_policy import SQLPolicyEngine
@@ -42,11 +41,8 @@ class ChatOrchestratorService:
         self,
         llm_agent: LLMAgentPort,
         warehouse: AnalyticsWarehousePort,
-        golden_kb: GoldenKnowledgePort,
         report_service: ReportService,
         confirmation_store: ConfirmationStorePort,
-        preference_store: UserPreferencePort,
-        persona_store: PersonaStorePort,
         cache: CachePort,
         observability: ObservabilityPort,
         pii_masker: PIIMasker,
@@ -54,15 +50,13 @@ class ChatOrchestratorService:
         max_sql_retries: int = 3,
         cache_ttl_seconds: int = 300,
         chat_history_limit: int = 10,
-        golden_trio_top_k: int = 3,
+        default_persona_tone: str = PersonaConfig().tone_instructions,
     ) -> None:
         self._llm = llm_agent
         self._warehouse = warehouse
-        self._golden_kb = golden_kb
         self._reports = report_service
         self._confirmations = confirmation_store
-        self._preferences = preference_store
-        self._persona = persona_store
+        self._persona = PersonaConfig(tone_instructions=default_persona_tone)
         self._cache = cache
         self._obs = observability
         self._masker = pii_masker
@@ -70,7 +64,6 @@ class ChatOrchestratorService:
         self._max_sql_retries = max_sql_retries
         self._cache_ttl = cache_ttl_seconds
         self._chat_history_limit = chat_history_limit
-        self._golden_trio_top_k = golden_trio_top_k
 
     async def confirm_action(self, request: ConfirmationRequest, user: UserContext) -> ChatResponse:
         trace_id = f"tr_{uuid4().hex[:12]}"
@@ -154,18 +147,12 @@ class ChatOrchestratorService:
                 observability={"trace_id": trace_id, "blocked": True},
             )
 
-        # 2. User-Level Continuous Learning: update preferences if detected
-        prefs = await self._preferences.get_preferences(user.user_id)
-        prefs_changed = False
+        # Preferences apply to this response only; persistence is design-only for the prototype.
+        prefs = UserPreferenceProfile(user_id=user.user_id)
         if decision.detected_format_preference is not None:
             prefs.preferred_format = decision.detected_format_preference
-            prefs_changed = True
         if decision.detected_depth_preference is not None:
             prefs.preferred_depth = decision.detected_depth_preference
-            prefs_changed = True
-        if prefs_changed:
-            prefs = await self._preferences.upsert_preferences(prefs)
-            self._obs.increment_metric("user_preference_updates_total")
 
         # 3. High-Stakes Destructive Operation Flow (Saved Reports Deletion)
         if decision.intent == IntentType.DELETE_REPORTS:
@@ -224,18 +211,13 @@ class ChatOrchestratorService:
             )
             return ChatResponse(session_id=request.session_id, trace_id=trace_id, reply=reply)
 
-        # 5. Hybrid Intelligence: retrieve Golden Trios + active CEO Persona + BigQuery Schema
+        # Golden knowledge retrieval and dynamic persona storage are design-only in this prototype.
         t_ret = time.perf_counter()
-        golden_trios = await self._golden_kb.search_similar_trios(
-            request.message, top_k=self._golden_trio_top_k
-        )
-        persona = await self._persona.get_active_persona()
         schema_summary = await self._warehouse.get_all_schemas_summary()
         self._obs.record_span(
             trace_id,
-            "hybrid_context_retrieval",
+            "schema_retrieval",
             (time.perf_counter() - t_ret) * 1000,
-            {"golden_trios_matched": len(golden_trios)},
         )
 
         # 6. SQL Generation + Safety Validation + Self-Correction Retry Loop
@@ -249,7 +231,6 @@ class ChatOrchestratorService:
             sql_plan = await self._llm.generate_sql_plan(
                 user_message=request.message,
                 schema_summary=schema_summary,
-                golden_trios=golden_trios,
                 user_context=user,
                 history=history,
                 previous_error=last_error,
@@ -344,8 +325,7 @@ class ChatOrchestratorService:
         synthesis = await self._llm.synthesize_response(
             user_message=request.message,
             query_result=query_result,
-            golden_trios=golden_trios,
-            persona=persona,
+            persona=self._persona,
             preferences=prefs,
             history=history,
         )
@@ -407,7 +387,6 @@ class ChatOrchestratorService:
                 "sql_attempts": query_result.attempts if query_result else 0,
                 "from_cache": query_result.from_cache if query_result else False,
                 "pii_redactions": pii_redactions_total,
-                "golden_trios_used": len(golden_trios),
             },
         )
 

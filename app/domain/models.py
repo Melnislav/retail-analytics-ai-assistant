@@ -16,7 +16,7 @@ def utc_now() -> datetime:
 
 class UserRole(StrEnum):
     EXECUTIVE = "executive"
-    CATEGORY_MANAGER = "category_manager"
+    BRAND_MANAGER = "brand_manager"
     CEO = "ceo"
     ADMIN = "admin"
 
@@ -35,20 +35,19 @@ class AnalysisDepthPreference(StrEnum):
 
 
 class UserContext(BaseModel):
-    """Authenticated executive/manager identity and product-level RBAC scope."""
+    """Authenticated executive/manager identity and brand-level RBAC scope."""
 
     model_config = ConfigDict(frozen=True)
 
     user_id: str = Field(..., min_length=1, description="Unique user identifier")
     display_name: str = Field(default="Executive User")
     role: UserRole = Field(default=UserRole.EXECUTIVE)
-    allowed_categories: list[str] = Field(
+    allowed_brands: list[str] = Field(
         default_factory=list,
-        description="Authorized product categories. Empty list with EXECUTIVE/CEO/ADMIN means full catalog; CATEGORY_MANAGER is restricted to listed categories.",
-    )
-    allowed_departments: list[str] = Field(
-        default_factory=list,
-        description="Optional department restriction (e.g., 'Men', 'Women').",
+        description=(
+            "Authorized product brands. Only CEO/ADMIN may leave this empty; "
+            "all other roles fail closed."
+        ),
     )
 
 
@@ -73,18 +72,6 @@ class PersonaConfig(BaseModel):
     )
     updated_by: str = "system"
     updated_at: datetime = Field(default_factory=utc_now)
-
-
-class GoldenTrio(BaseModel):
-    """Historical analyst-verified (Question -> SQL -> Analyst Report) trio."""
-
-    trio_id: str = Field(default_factory=lambda: str(uuid4()))
-    question: str
-    sql_query: str
-    analyst_report: str
-    tags: list[str] = Field(default_factory=list)
-    verified: bool = True
-    created_at: datetime = Field(default_factory=utc_now)
 
 
 class IntentType(StrEnum):
@@ -124,7 +111,7 @@ class GuardrailDecision(BaseModel):
 class SQLPlan(BaseModel):
     """Structured SQL generation output from the LLM agent."""
 
-    reasoning: str = Field(..., description="Analytical logic referencing Golden Trios and schema")
+    reasoning: str = Field(..., description="Analytical logic referencing the available schema")
     sql_query: str = Field(..., description="Valid BigQuery StandardSQL SELECT query")
     requires_sql: bool = Field(
         default=True,

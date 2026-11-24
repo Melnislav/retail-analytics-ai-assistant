@@ -40,14 +40,6 @@ class Settings(BaseSettings):
     llm_temperature: float = Field(default=0.1, validation_alias="LLM_TEMPERATURE")
     llm_timeout_seconds: int = Field(default=15, validation_alias="LLM_TIMEOUT_SECONDS")
 
-    # Circuit Breaker & Resilience
-    circuit_breaker_failure_threshold: int = Field(
-        default=2, validation_alias="CIRCUIT_BREAKER_FAILURE_THRESHOLD"
-    )
-    circuit_breaker_recovery_timeout_seconds: int = Field(
-        default=60, validation_alias="CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECONDS"
-    )
-
     # BigQuery
     gcp_project_id: str = Field(default="", validation_alias="GCP_PROJECT_ID")
     bq_dataset_id: str = Field(
@@ -79,10 +71,13 @@ class Settings(BaseSettings):
     chat_history_ttl_seconds: int = Field(
         default=86400, validation_alias="CHAT_HISTORY_TTL_SECONDS"
     )
-    golden_trio_top_k: int = Field(default=3, validation_alias="GOLDEN_TRIO_TOP_K")
-
     # Data Protection & PII
     pii_salt: str = Field(default="opsfleet-pii-salt-2026", validation_alias="PII_SALT")
+    demographic_min_group_size: int = Field(
+        default=5,
+        ge=2,
+        validation_alias="DEMOGRAPHIC_MIN_GROUP_SIZE",
+    )
 
     # Observability
     langfuse_public_key: str = Field(default="", validation_alias="LANGFUSE_PUBLIC_KEY")

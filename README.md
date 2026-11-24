@@ -10,20 +10,20 @@ Production-ready prototype built with Python.
 │   ├── domain/                  # Pure business rules & Pydantic models (zero framework imports)
 │   │   ├── models.py            # UserContext, SQLPlan, GuardrailDecision, SavedReport, PendingConfirmation
 │   │   ├── pii_masker.py        # Column-level + regex PII redaction & customer pseudonymization
-│   │   ├── sql_policy.py        # Read-only SQL firewall, table allowlist & product-level RBAC filter injection
+│   │   ├── sql_policy.py        # SQLGlot AST firewall, brand RBAC & demographic k-anonymity guard
 │   │   └── exceptions.py        # Typed domain exception hierarchy
 │   ├── application/             # Inbound/Outbound Ports (Protocols) & Orchestration Services
-│   │   ├── ports.py             # ChatUseCasePort, AnalyticsWarehousePort, LLMAgentPort, GoldenKnowledgePort, etc.
-│   │   ├── chat_orchestrator.py # Guardrails -> Golden Trios -> SQL Self-Correction -> PII Masking -> Synthesis
+│   │   ├── ports.py             # ChatUseCasePort, AnalyticsWarehousePort, LLMAgentPort, etc.
+│   │   ├── chat_orchestrator.py # Guardrails -> SQL Self-Correction -> PII Masking -> Synthesis
 │   │   └── report_service.py    # Saved Reports CRUD + 2-step Human-in-the-Loop destructive deletion flow
 │   ├── adapters/
 │   │   ├── inbound/
-│   │   │   ├── http_api.py      # FastAPI REST endpoints (/chat, /chat/confirm, /reports, /persona, /metrics)
+│   │   │   ├── http_api.py      # FastAPI REST endpoints (/chat, /chat/confirm, /reports, /metrics)
 │   │   │   └── cli_client.py    # Interactive Rich CLI chat client
 │   │   └── outbound/
 │   │       ├── bigquery_adapter.py     # Async BigQueryRunner + mock fallback for credential-free evaluation
-│   │       ├── langchain_adapter.py    # LangChain async Gemini (primary) + OpenAI (fallback) structured outputs
-│   │       ├── persistence_adapter.py  # Async SQLAlchemy (PostgreSQL / SQLite) repositories
+│   │       ├── langchain_adapter.py    # LangChain structured outputs + native provider fallback
+│   │       ├── persistence_adapter.py  # Async SQLAlchemy saved-report repository
 │   │       └── redis_and_telemetry.py  # Async Redis cache/TTL confirmation store + Langfuse/metrics observability
 │   ├── infrastructure/
 │   │   ├── config.py            # Pydantic BaseSettings (.env)
@@ -59,8 +59,9 @@ Production-ready prototype built with Python.
    ```bash
    curl -X POST http://localhost:8000/api/v1/chat \
      -H "Content-Type: application/json" \
-     -H "X-User-Id: exec_alice" \
-     -H "X-User-Role: executive" \
+     -H "X-User-Id: manager_alice" \
+     -H "X-User-Role: brand_manager" \
+     -H "X-Allowed-Brands: Calvin Klein,adidas" \
      -d '{"message": "Why did our churn rate spike last month? Create a report with Q2 action items.", "save_report": true}'
    ```
 
@@ -70,6 +71,10 @@ The dataset `bigquery-public-data.thelook_ecommerce` is publicly readable, while
 
 ### Option A: Zero-Config Evaluation (Default)
 Keep `BIGQUERY_MOCK_MODE=true` in `.env`. No GCP account or credentials are required; the adapter serves deterministic `thelook_ecommerce` fixtures so the full agent pipeline (guardrails, RBAC, PII redaction, HITL confirmation) can be tested immediately.
+
+Manager access is fail-closed and scoped only by `X-Allowed-Brands`. Only `ceo` and `admin`
+roles can query the full catalog. In production, these trusted values must come from verified JWT
+claims rather than directly from client-controlled headers.
 
 ### Option B: Live BigQuery via Docker / Local Dev
 1. Create a GCP project (free BigQuery Sandbox works without billing) and enable **BigQuery API**.

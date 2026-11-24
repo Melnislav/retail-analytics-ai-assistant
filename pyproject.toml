@@ -27,6 +27,7 @@ dependencies = [
     "httpx>=0.28.0",
     "rich>=13.9.0",
     "langfuse>=2.57.0",
+    "sqlglot>=28.0.0",
 ]
 
 [project.optional-dependencies]

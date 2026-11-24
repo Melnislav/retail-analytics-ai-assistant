@@ -10,7 +10,6 @@ from app.domain.models import (
     ChatRequest,
     ChatResponse,
     ConfirmationRequest,
-    GoldenTrio,
     GuardrailDecision,
     PendingConfirmation,
     PersonaConfig,
@@ -54,12 +53,6 @@ class ReportManagementPort(Protocol):
     ) -> int: ...
 
 
-class PersonaManagementPort(Protocol):
-    async def get_persona(self) -> PersonaConfig: ...
-
-    async def update_persona(self, tone_instructions: str, updated_by: str) -> PersonaConfig: ...
-
-
 # ==============================================================================
 # OUTBOUND PORTS (Application Core -> Driven Infrastructure Adapters)
 # ==============================================================================
@@ -84,7 +77,6 @@ class LLMAgentPort(Protocol):
         self,
         user_message: str,
         schema_summary: str,
-        golden_trios: list[GoldenTrio],
         user_context: UserContext,
         history: list[ChatMessage],
         previous_error: str | None = None,
@@ -95,19 +87,10 @@ class LLMAgentPort(Protocol):
         self,
         user_message: str,
         query_result: QueryExecutionResult | None,
-        golden_trios: list[GoldenTrio],
         persona: PersonaConfig,
         preferences: UserPreferenceProfile,
         history: list[ChatMessage],
     ) -> AnalystSynthesis: ...
-
-
-class GoldenKnowledgePort(Protocol):
-    async def search_similar_trios(self, query: str, top_k: int = 3) -> list[GoldenTrio]: ...
-
-    async def add_trio(self, trio: GoldenTrio) -> GoldenTrio: ...
-
-    async def seed_defaults_if_empty(self) -> None: ...
 
 
 class ReportRepositoryPort(Protocol):
@@ -126,18 +109,6 @@ class ConfirmationStorePort(Protocol):
     async def save_pending(self, confirmation: PendingConfirmation) -> None: ...
 
     async def pop_pending(self, token: str, user_id: str) -> PendingConfirmation | None: ...
-
-
-class UserPreferencePort(Protocol):
-    async def get_preferences(self, user_id: str) -> UserPreferenceProfile: ...
-
-    async def upsert_preferences(self, profile: UserPreferenceProfile) -> UserPreferenceProfile: ...
-
-
-class PersonaStorePort(Protocol):
-    async def get_active_persona(self) -> PersonaConfig: ...
-
-    async def save_persona(self, persona: PersonaConfig) -> PersonaConfig: ...
 
 
 class CachePort(Protocol):

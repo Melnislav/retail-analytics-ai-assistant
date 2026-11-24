@@ -4,13 +4,7 @@ from __future__ import annotations
 
 from app.adapters.outbound.bigquery_adapter import AsyncBigQueryAdapter
 from app.adapters.outbound.langchain_adapter import LangChainRetailAgentAdapter
-from app.adapters.outbound.persistence_adapter import (
-    DatabaseManager,
-    PostgresGoldenKnowledgeRepository,
-    PostgresPersonaRepository,
-    PostgresReportRepository,
-    PostgresUserPreferenceRepository,
-)
+from app.adapters.outbound.persistence_adapter import DatabaseManager, PostgresReportRepository
 from app.adapters.outbound.redis_and_telemetry import (
     AsyncRedisAdapter,
     StructuredObservabilityAdapter,
@@ -39,23 +33,15 @@ class ApplicationContainer:
             langfuse_host=settings.langfuse_host,
         )
 
-        # Repositories
+        # Only saved reports require prototype persistence.
         self.report_repo = PostgresReportRepository(self.db_manager.session_factory)
-        self.golden_kb = PostgresGoldenKnowledgeRepository(
-            self.db_manager.session_factory,
-            dataset_id=settings.bq_dataset_id,
-        )
-        self.preference_store = PostgresUserPreferenceRepository(self.db_manager.session_factory)
-        self.persona_store = PostgresPersonaRepository(
-            self.db_manager.session_factory,
-            default_tone=settings.default_persona_tone,
-        )
 
         # Domain Policies
         self.pii_masker = PIIMasker(salt=settings.pii_salt)
         self.sql_policy = SQLPolicyEngine(
             dataset_id=settings.bq_dataset_id,
             default_limit=settings.default_row_limit,
+            demographic_min_group_size=settings.demographic_min_group_size,
         )
 
         # Warehouse & LLM Adapters
@@ -77,11 +63,8 @@ class ApplicationContainer:
             openai_model=settings.openai_model,
             temperature=settings.llm_temperature,
             timeout_seconds=settings.llm_timeout_seconds,
-            circuit_breaker_failure_threshold=settings.circuit_breaker_failure_threshold,
-            circuit_breaker_recovery_timeout=float(
-                settings.circuit_breaker_recovery_timeout_seconds
-            ),
             dataset_id=settings.bq_dataset_id,
+            demographic_min_group_size=settings.demographic_min_group_size,
             pii_masker=self.pii_masker,
         )
 
@@ -94,11 +77,8 @@ class ApplicationContainer:
         self.chat_orchestrator = ChatOrchestratorService(
             llm_agent=self.llm_agent,
             warehouse=self.warehouse,
-            golden_kb=self.golden_kb,
             report_service=self.report_service,
             confirmation_store=self.redis_adapter,
-            preference_store=self.preference_store,
-            persona_store=self.persona_store,
             cache=self.redis_adapter,
             observability=self.observability,
             pii_masker=self.pii_masker,
@@ -106,12 +86,11 @@ class ApplicationContainer:
             max_sql_retries=settings.max_sql_retries,
             cache_ttl_seconds=settings.cache_ttl_seconds,
             chat_history_limit=settings.chat_history_limit,
-            golden_trio_top_k=settings.golden_trio_top_k,
+            default_persona_tone=settings.default_persona_tone,
         )
 
     async def startup(self) -> None:
         await self.db_manager.init_schema()
-        await self.golden_kb.seed_defaults_if_empty()
 
     async def shutdown(self) -> None:
         await self.redis_adapter.close()

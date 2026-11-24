@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
+from langchain_core.messages import BaseMessage
+from langchain_core.runnables import RunnableLambda
+from sqlglot import parse_one
 
+from app.adapters.inbound.http_api import get_current_user
 from app.adapters.outbound.langchain_adapter import LangChainRetailAgentAdapter, LLMProvider
-from app.domain.circuit_breaker import CircuitBreaker
 from app.domain.models import ChatMessage, GuardrailDecision, IntentType, UserContext, UserRole
 from app.domain.pii_masker import PIIMasker
 from app.domain.sql_policy import SQLPolicyEngine
@@ -63,17 +67,19 @@ def test_pii_masker_redacts_sql_literals_and_exact_coordinates() -> None:
 @pytest.mark.asyncio
 async def test_langchain_boundary_masks_current_message_and_history() -> None:
     adapter = LangChainRetailAgentAdapter()
-    structured_model = MagicMock()
-    structured_model.ainvoke = AsyncMock(
-        return_value=GuardrailDecision(intent=IntentType.DATA_ANALYSIS, is_safe=True)
-    )
+    captured_messages: list[BaseMessage] = []
+
+    async def capture_messages(messages: list[BaseMessage]) -> GuardrailDecision:
+        captured_messages.extend(messages)
+        return GuardrailDecision(intent=IntentType.DATA_ANALYSIS, is_safe=True)
+
+    structured_model = RunnableLambda(capture_messages)
     model = MagicMock()
     model.with_structured_output.return_value = structured_model
     adapter._providers = [
         LLMProvider(
             name="test",
             model=model,
-            circuit_breaker=CircuitBreaker("test"),
         )
     ]
     history = [
@@ -90,10 +96,7 @@ async def test_langchain_boundary_masks_current_message_and_history() -> None:
     )
 
     assert decision.is_safe is True
-    invocation = structured_model.ainvoke.await_args
-    assert invocation is not None
-    sent_messages = invocation.args[0]
-    sent_text = "\n".join(str(message.content) for message in sent_messages)
+    sent_text = "\n".join(str(message.content) for message in captured_messages)
     for pii_value in (
         "jane@example.com",
         "742 Evergreen Terrace",
@@ -107,26 +110,117 @@ async def test_langchain_boundary_masks_current_message_and_history() -> None:
     assert "Compare revenue by brand." in sent_text
 
 
-def test_sql_policy_blocks_mutations_and_enforces_product_rbac() -> None:
+def test_sql_policy_enforces_brand_scope_without_recursive_cte() -> None:
     policy = SQLPolicyEngine()
-    exec_user = UserContext(user_id="u1", role=UserRole.EXECUTIVE)
+    ceo = UserContext(user_id="u1", role=UserRole.CEO)
 
-    bad_res = policy.validate_and_secure("DROP TABLE orders", exec_user)
+    bad_res = policy.validate_and_secure("DROP TABLE orders", ceo)
     assert not bad_res.is_valid
 
-    cat_mgr = UserContext(
-        user_id="mgr_jeans",
-        role=UserRole.CATEGORY_MANAGER,
-        allowed_categories=["Jeans", "Outerwear & Coats"],
+    brand_manager = UserContext(
+        user_id="mgr_acme",
+        role=UserRole.BRAND_MANAGER,
+        allowed_brands=["Acme", "O'Reilly"],
     )
     ok_res = policy.validate_and_secure(
-        "SELECT category, SUM(retail_price) FROM `bigquery-public-data.thelook_ecommerce.products` GROUP BY category",
-        cat_mgr,
+        "SELECT p.brand, SUM(oi.sale_price) AS revenue "
+        "FROM `bigquery-public-data.thelook_ecommerce.order_items` oi "
+        "JOIN `bigquery-public-data.thelook_ecommerce.products` p ON oi.product_id = p.id "
+        "GROUP BY p.brand",
+        brand_manager,
     )
     assert ok_res.is_valid
-    assert "__scoped_products" in ok_res.sanitized_sql
-    assert "category IN ('Jeans', 'Outerwear & Coats')" in ok_res.sanitized_sql
+    assert "p.brand IN ('Acme', 'O\\'Reilly')" in ok_res.sanitized_sql
+    assert "FROM `__scoped_order_items` AS oi" in ok_res.sanitized_sql
+    assert "JOIN `__allowed_products` AS p" in ok_res.sanitized_sql
+    assert "FROM `__allowed_products` AS p WHERE" not in ok_res.sanitized_sql
+    assert "FROM `bigquery-public-data.thelook_ecommerce.products` AS p" in ok_res.sanitized_sql
     assert "LIMIT 200" in ok_res.sanitized_sql
+    assert parse_one(ok_res.sanitized_sql, dialect="bigquery") is not None
+
+
+def test_sql_policy_scopes_orders_and_users_without_product_join() -> None:
+    policy = SQLPolicyEngine()
+    manager = UserContext(
+        user_id="mgr_acme",
+        role=UserRole.BRAND_MANAGER,
+        allowed_brands=["Acme"],
+    )
+
+    order_result = policy.validate_and_secure(
+        "SELECT COUNT(DISTINCT order_id) AS orders FROM orders",
+        manager,
+    )
+    user_result = policy.validate_and_secure(
+        "SELECT COUNT(DISTINCT id) AS customers FROM users",
+        manager,
+    )
+
+    assert order_result.is_valid
+    assert "FROM __scoped_orders" in order_result.sanitized_sql
+    assert user_result.is_valid
+    assert "FROM __scoped_users" in user_result.sanitized_sql
+
+
+def test_sql_policy_blocks_pii_alias_and_small_demographic_groups() -> None:
+    policy = SQLPolicyEngine(demographic_min_group_size=5)
+    ceo = UserContext(user_id="ceo", role=UserRole.CEO)
+
+    aliased_pii = policy.validate_and_secure(
+        "SELECT first_name AS client FROM users",
+        ceo,
+    )
+    wildcard_pii = policy.validate_and_secure("SELECT * FROM users", ceo)
+    serialized_user = policy.validate_and_secure(
+        "SELECT TO_JSON_STRING(u) AS client FROM users u",
+        ceo,
+    )
+    aggregate_count = policy.validate_and_secure("SELECT COUNT(*) AS customers FROM users", ceo)
+    unsafe_demographics = policy.validate_and_secure(
+        "SELECT u.city, COUNT(DISTINCT u.id) AS customers "
+        "FROM users u GROUP BY u.city HAVING COUNT(DISTINCT u.id) >= 4",
+        ceo,
+    )
+    bypassed_demographics = policy.validate_and_secure(
+        "SELECT u.city, COUNT(DISTINCT u.id) AS customers "
+        "FROM users u GROUP BY u.city "
+        "HAVING COUNT(DISTINCT u.id) >= 5 OR 1 = 1",
+        ceo,
+    )
+    safe_demographics = policy.validate_and_secure(
+        "SELECT u.city, COUNT(DISTINCT u.id) AS customers "
+        "FROM users u GROUP BY u.city HAVING COUNT(DISTINCT u.id) >= 5",
+        ceo,
+    )
+
+    assert not aliased_pii.is_valid
+    assert "even when renamed" in aliased_pii.violations[0]
+    assert not wildcard_pii.is_valid
+    assert not serialized_user.is_valid
+    assert aggregate_count.is_valid
+    assert not unsafe_demographics.is_valid
+    assert not bypassed_demographics.is_valid
+    assert any("minimum-size" in item or ">= 5" in item for item in unsafe_demographics.violations)
+    assert safe_demographics.is_valid
+
+
+def test_http_identity_uses_brands_and_rejects_unknown_roles() -> None:
+    user = get_current_user(
+        x_user_id="manager_1",
+        x_user_name="Manager One",
+        x_user_role="brand_manager",
+        x_allowed_brands="Acme, Contoso",
+    )
+    assert user.allowed_brands == ["Acme", "Contoso"]
+
+    with pytest.raises(HTTPException) as exc_info:
+        get_current_user(
+            x_user_id="attacker",
+            x_user_name="Unknown",
+            x_user_role="not-a-role",
+            x_allowed_brands="",
+        )
+    assert exc_info.value.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -145,7 +239,7 @@ async def test_end_to_end_report_creation_and_two_step_deletion(tmp_path: Path) 
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            headers = {"X-User-Id": "exec_1", "X-User-Role": "executive"}
+            headers = {"X-User-Id": "ceo_1", "X-User-Role": "ceo"}
 
             # 1. Create and save a report mentioning Client X
             r1 = await client.post(
@@ -200,7 +294,7 @@ def test_settings_and_container_wiring() -> None:
         pii_salt="custom-pii-salt-xyz",
         chat_history_limit=15,
         chat_history_ttl_seconds=3600,
-        golden_trio_top_k=5,
+        demographic_min_group_size=7,
         default_row_limit=150,
         database_url="sqlite+aiosqlite:///:memory:",
         bigquery_mock_mode=True,
@@ -212,6 +306,6 @@ def test_settings_and_container_wiring() -> None:
     assert container.pii_masker._salt == "custom-pii-salt-xyz"
     assert container.redis_adapter._chat_history_ttl == 3600
     assert container.chat_orchestrator._chat_history_limit == 15
-    assert container.chat_orchestrator._golden_trio_top_k == 5
     assert container.sql_policy._default_limit == 150
+    assert container.sql_policy._demographic_min_group_size == 7
     assert container.sql_policy._dataset_id == "custom-project.custom_retail_dataset"

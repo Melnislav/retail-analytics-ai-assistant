@@ -22,10 +22,10 @@ class RetailAssistantCLI:
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.session_id = f"cli_{uuid4().hex[:8]}"
-        self.user_id = os.getenv("CLI_USER_ID", "exec_alice")
-        self.user_name = os.getenv("CLI_USER_NAME", "Alice (VP Retail)")
-        self.user_role = os.getenv("CLI_USER_ROLE", "executive")
-        self.allowed_categories = os.getenv("CLI_ALLOWED_CATEGORIES", "")
+        self.user_id = os.getenv("CLI_USER_ID", "manager_alice")
+        self.user_name = os.getenv("CLI_USER_NAME", "Alice (Brand Manager)")
+        self.user_role = os.getenv("CLI_USER_ROLE", "brand_manager")
+        self.allowed_brands = os.getenv("CLI_ALLOWED_BRANDS", "")
 
     @property
     def headers(self) -> dict[str, str]:
@@ -33,7 +33,7 @@ class RetailAssistantCLI:
             "X-User-Id": self.user_id,
             "X-User-Name": self.user_name,
             "X-User-Role": self.user_role,
-            "X-Allowed-Categories": self.allowed_categories,
+            "X-Allowed-Brands": self.allowed_brands,
         }
 
     def print_banner(self) -> None:
@@ -44,7 +44,7 @@ class RetailAssistantCLI:
                 f"User: [green]{self.user_name}[/green] (`{self.user_id}`, role=`{self.user_role}`)\n"
                 f"Session: [yellow]{self.session_id}[/yellow] | API: {self.base_url}\n"
                 "Commands: [bold]/reports[/bold], [bold]/save <question>[/bold], "
-                "[bold]/persona <tone>[/bold], [bold]/role <role> [categories][/bold], [bold]/exit[/bold]",
+                "[bold]/role <role> [brands][/bold], [bold]/exit[/bold]",
                 border_style="cyan",
             )
         )
@@ -103,42 +103,13 @@ class RetailAssistantCLI:
                         console.print(f"[red]Error {resp.status_code}: {resp.text}[/red]")
                     continue
 
-                if text.lower().startswith("/persona "):
-                    new_tone = text[len("/persona ") :].strip()
-                    try:
-                        resp = await client.put(
-                            f"{self.base_url}/api/v1/persona",
-                            headers=self.headers,
-                            json={"tone_instructions": new_tone},
-                        )
-                    except httpx.TimeoutException:
-                        console.print(
-                            "[bold yellow]Request timed out while updating persona.[/bold yellow]"
-                        )
-                        continue
-                    except httpx.ConnectError:
-                        console.print(
-                            f"[bold red]Could not connect to API at {self.base_url}.[/bold red]"
-                        )
-                        continue
-                    except httpx.HTTPError as exc:
-                        console.print(f"[bold red]Network error updating persona:[/bold red] {exc}")
-                        continue
-
-                    console.print(
-                        f"[green]Updated CEO Persona:[/green] {resp.json().get('tone_instructions')}"
-                        if resp.status_code == 200
-                        else f"[red]Failed: {resp.text}[/red]"
-                    )
-                    continue
-
                 if text.lower().startswith("/role "):
                     parts = text.split(maxsplit=2)
                     self.user_role = parts[1]
-                    self.allowed_categories = parts[2] if len(parts) > 2 else ""
+                    self.allowed_brands = parts[2] if len(parts) > 2 else ""
                     console.print(
                         f"[yellow]Switched role to `{self.user_role}` "
-                        f"(categories: `{self.allowed_categories or 'ALL'}`)[/yellow]"
+                        f"(brands: `{self.allowed_brands or 'NONE'}`)[/yellow]"
                     )
                     continue
 

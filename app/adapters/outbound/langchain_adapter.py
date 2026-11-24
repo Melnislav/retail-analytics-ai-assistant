@@ -1,22 +1,19 @@
-"""Async LangChain adapter supporting Google Gemini, OpenRouter, and OpenAI with Circuit Breaker and structured outputs."""
+"""Async LangChain adapter with structured outputs and native provider fallbacks."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import TypeVar, cast
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from app.domain.circuit_breaker import CircuitBreaker
 from app.domain.models import (
     AnalysisDepthPreference,
     AnalystSynthesis,
     ChatMessage,
-    GoldenTrio,
     GuardrailDecision,
     IntentType,
     OutputFormatPreference,
@@ -37,11 +34,10 @@ T = TypeVar("T")
 class LLMProvider:
     name: str
     model: BaseChatModel
-    circuit_breaker: CircuitBreaker
 
 
 class LangChainRetailAgentAdapter:
-    """Implements LLMAgentPort using LangChain async structured outputs, Circuit Breaker & failover."""
+    """Implements structured LLM calls with LangChain-native provider failover."""
 
     def __init__(
         self,
@@ -55,14 +51,12 @@ class LangChainRetailAgentAdapter:
         openai_model: str = "gpt-4o-mini",
         temperature: float = 0.1,
         timeout_seconds: int = 15,
-        circuit_breaker_failure_threshold: int = 2,
-        circuit_breaker_recovery_timeout: float = 60.0,
         dataset_id: str = "bigquery-public-data.thelook_ecommerce",
+        demographic_min_group_size: int = 5,
         pii_masker: PIIMasker | None = None,
     ) -> None:
         self._dataset_id = dataset_id
-        self._timeout_seconds = timeout_seconds
-        self._primary_provider_name = provider.lower()
+        self._demographic_min_group_size = demographic_min_group_size
         self._pii_masker = pii_masker or PIIMasker()
         self._providers: list[LLMProvider] = self._build_providers(
             provider=provider,
@@ -75,8 +69,6 @@ class LangChainRetailAgentAdapter:
             openai_model=openai_model,
             temperature=temperature,
             timeout_seconds=timeout_seconds,
-            failure_threshold=circuit_breaker_failure_threshold,
-            recovery_timeout=circuit_breaker_recovery_timeout,
         )
 
     @property
@@ -100,8 +92,6 @@ class LangChainRetailAgentAdapter:
         openai_model: str,
         temperature: float,
         timeout_seconds: int,
-        failure_threshold: int,
-        recovery_timeout: float,
     ) -> list[LLMProvider]:
         providers: list[LLMProvider] = []
 
@@ -120,11 +110,6 @@ class LangChainRetailAgentAdapter:
                     LLMProvider(
                         name="gemini",
                         model=gemini_llm,
-                        circuit_breaker=CircuitBreaker(
-                            name="gemini",
-                            failure_threshold=failure_threshold,
-                            recovery_timeout_seconds=recovery_timeout,
-                        ),
                     )
                 )
             except Exception as exc:
@@ -147,11 +132,6 @@ class LangChainRetailAgentAdapter:
                     LLMProvider(
                         name="openrouter",
                         model=openrouter_llm,
-                        circuit_breaker=CircuitBreaker(
-                            name="openrouter",
-                            failure_threshold=failure_threshold,
-                            recovery_timeout_seconds=recovery_timeout,
-                        ),
                     )
                 )
             except Exception as exc:
@@ -173,11 +153,6 @@ class LangChainRetailAgentAdapter:
                     LLMProvider(
                         name="openai",
                         model=openai_llm,
-                        circuit_breaker=CircuitBreaker(
-                            name="openai",
-                            failure_threshold=failure_threshold,
-                            recovery_timeout_seconds=recovery_timeout,
-                        ),
                     )
                 )
             except Exception as exc:
@@ -204,43 +179,23 @@ class LangChainRetailAgentAdapter:
 
         safe_messages = self._mask_messages(messages)
 
-        for entry in self._providers:
-            if not entry.circuit_breaker.can_execute():
-                logger.info(
-                    "Circuit breaker for provider '%s' is OPEN; skipping to fallback for %s.",
-                    entry.name,
-                    task_name,
-                )
-                continue
-
-            try:
-                structured_model = entry.model.with_structured_output(schema)
-                # Hard deadline timeout wrapping (asyncio.wait_for)
-                result = await asyncio.wait_for(
-                    structured_model.ainvoke(safe_messages),  # type: ignore[arg-type]
-                    timeout=float(self._timeout_seconds),
-                )
-                entry.circuit_breaker.record_success()
-                return result  # type: ignore[return-value]
-            except TimeoutError:
-                logger.warning(
-                    "LLM provider '%s' timed out after %ds during %s.",
-                    entry.name,
-                    self._timeout_seconds,
-                    task_name,
-                )
-                entry.circuit_breaker.record_failure()
-            except Exception as exc:
-                logger.warning(
-                    "LLM provider '%s' failed during %s: %s",
-                    entry.name,
-                    task_name,
-                    exc,
-                )
-                entry.circuit_breaker.record_failure(exc)
+        structured_models = [
+            entry.model.with_structured_output(schema) for entry in self._providers
+        ]
+        provider_chain = structured_models[0].with_fallbacks(structured_models[1:])
+        try:
+            result = await provider_chain.ainvoke(safe_messages)  # type: ignore[arg-type]
+            return cast(T, result)
+        except Exception as exc:
+            logger.warning(
+                "All configured LLM providers (%s) failed during %s: %s",
+                ", ".join(entry.name for entry in self._providers),
+                task_name,
+                exc,
+            )
 
         logger.warning(
-            "All configured LLM providers failed or circuit-broken during %s; falling back to heuristic rules.",
+            "Falling back to deterministic heuristic rules during %s.",
             task_name,
         )
         return None
@@ -367,16 +322,11 @@ class LangChainRetailAgentAdapter:
         self,
         user_message: str,
         schema_summary: str,
-        golden_trios: list[GoldenTrio],
         user_context: UserContext,
         history: list[ChatMessage],
         previous_error: str | None = None,
         previous_sql: str | None = None,
     ) -> SQLPlan:
-        trios_text = "\n\n".join(
-            f"### Golden Trio {i + 1}\nQuestion: {t.question}\nSQL:\n```sql\n{t.sql_query}\n```\nAnalyst Logic: {t.analyst_report}"
-            for i, t in enumerate(golden_trios)
-        )
         retry_context = ""
         if previous_error:
             retry_context = (
@@ -387,12 +337,14 @@ class LangChainRetailAgentAdapter:
         system_prompt = (
             "You are a Principal Retail Data Analyst generating BigQuery StandardSQL.\n"
             f"Available Schema:\n{schema_summary}\n\n"
-            f"Reference Golden Knowledge Trios (apply similar business logic & metric definitions):\n{trios_text}\n\n"
             "STRICT RULES:\n"
             f"1. Generate ONLY read-only SELECT queries against `{self._dataset_id}`.\n"
             "2. NEVER select PII columns (`first_name`, `last_name`, `email`, `street_address`, `postal_code`, `latitude`, `longitude`).\n"
-            "3. Always aggregate metrics cleanly (ROUND floats to 2 decimals) and include an ORDER BY + LIMIT.\n"
-            "4. If the user asks about available tables/schema structure only, set `requires_sql=False`."
+            "3. Demographics (`age`, `gender`, `city`, `state`, `country`, `traffic_source`) "
+            "must only appear as GROUP BY dimensions and must include "
+            f"HAVING COUNT(DISTINCT customer) >= {self._demographic_min_group_size}.\n"
+            "4. Always aggregate metrics cleanly (ROUND floats to 2 decimals) and include an ORDER BY + LIMIT.\n"
+            "5. If the user asks about available tables/schema structure only, set `requires_sql=False`."
             f"{retry_context}"
         )
 
@@ -421,7 +373,8 @@ class LangChainRetailAgentAdapter:
                 f"FROM `{self._dataset_id}.users` u "
                 f"JOIN `{self._dataset_id}.order_items` oi ON u.id = oi.user_id "
                 f"WHERE oi.status = 'Complete' "
-                f"GROUP BY u.state ORDER BY avg_spend_usd DESC LIMIT 20"
+                f"GROUP BY u.state HAVING COUNT(DISTINCT u.id) >= {self._demographic_min_group_size} "
+                f"ORDER BY avg_spend_usd DESC LIMIT 20"
             )
         elif "churn" in low or "return" in low:
             sql = (
@@ -443,7 +396,7 @@ class LangChainRetailAgentAdapter:
                 f"GROUP BY p.category, p.department ORDER BY revenue_usd DESC LIMIT 20"
             )
         return SQLPlan(
-            reasoning="Generated BigQuery StandardSQL query aligned with Golden Trio business logic.",
+            reasoning="Generated BigQuery StandardSQL query aligned with the available schema.",
             sql_query=sql,
             requires_sql=True,
             target_tables=["orders", "order_items", "products", "users"],
@@ -453,7 +406,6 @@ class LangChainRetailAgentAdapter:
         self,
         user_message: str,
         query_result: QueryExecutionResult | None,
-        golden_trios: list[GoldenTrio],
         persona: PersonaConfig,
         preferences: UserPreferenceProfile,
         history: list[ChatMessage],

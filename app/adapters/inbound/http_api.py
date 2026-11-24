@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel, Field
 
 from app.application.chat_orchestrator import ChatOrchestratorService
-from app.application.ports import ObservabilityPort, PersonaStorePort, UserPreferencePort
+from app.application.ports import ObservabilityPort
 from app.application.report_service import ReportService
 from app.domain.exceptions import (
     DomainError,
@@ -20,10 +19,8 @@ from app.domain.models import (
     ChatRequest,
     ChatResponse,
     ConfirmationRequest,
-    PersonaConfig,
     SavedReport,
     UserContext,
-    UserPreferenceProfile,
     UserRole,
 )
 
@@ -31,26 +28,26 @@ router = APIRouter(prefix="/api/v1", tags=["Retail Data Analysis Assistant"])
 
 
 def get_current_user(
-    x_user_id: str = Header(default="exec_alice", alias="X-User-Id"),
-    x_user_name: str = Header(default="Alice (VP Retail)", alias="X-User-Name"),
-    x_user_role: str = Header(default="executive", alias="X-User-Role"),
-    x_allowed_categories: str = Header(default="", alias="X-Allowed-Categories"),
-    x_allowed_departments: str = Header(default="", alias="X-Allowed-Departments"),
+    x_user_id: str = Header(default="manager_alice", alias="X-User-Id"),
+    x_user_name: str = Header(default="Alice (Brand Manager)", alias="X-User-Name"),
+    x_user_role: str = Header(default="brand_manager", alias="X-User-Role"),
+    x_allowed_brands: str = Header(default="", alias="X-Allowed-Brands"),
 ) -> UserContext:
-    """Extracts user identity and product RBAC permissions from request headers."""
+    """Extracts user identity and brand permissions from trusted request headers."""
     try:
         role = UserRole(x_user_role.lower())
-    except ValueError:
-        role = UserRole.EXECUTIVE
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Unknown user role; access denied.",
+        ) from exc
 
-    categories = [c.strip() for c in x_allowed_categories.split(",") if c.strip()]
-    departments = [d.strip() for d in x_allowed_departments.split(",") if d.strip()]
+    brands = [brand.strip() for brand in x_allowed_brands.split(",") if brand.strip()]
     return UserContext(
         user_id=x_user_id,
         display_name=x_user_name,
         role=role,
-        allowed_categories=categories,
-        allowed_departments=departments,
+        allowed_brands=brands,
     )
 
 
@@ -60,14 +57,6 @@ def get_orchestrator(request: Request) -> ChatOrchestratorService:
 
 def get_report_service(request: Request) -> ReportService:
     return request.app.state.container.report_service
-
-
-def get_persona_store(request: Request) -> PersonaStorePort:
-    return request.app.state.container.persona_store
-
-
-def get_preference_store(request: Request) -> UserPreferencePort:
-    return request.app.state.container.preference_store
 
 
 def get_observability(request: Request) -> ObservabilityPort:
@@ -111,49 +100,6 @@ async def list_reports(
     report_service: ReportService = Depends(get_report_service),
 ) -> list[SavedReport]:
     return await report_service.list_user_reports(user)
-
-
-class PersonaUpdateRequest(BaseModel):
-    tone_instructions: str = Field(..., min_length=5, max_length=2000)
-
-
-@router.get("/persona", response_model=PersonaConfig)
-async def get_persona(
-    persona_store: PersonaStorePort = Depends(get_persona_store),
-) -> PersonaConfig:
-    return await persona_store.get_active_persona()
-
-
-@router.put("/persona", response_model=PersonaConfig)
-async def update_persona(
-    payload: PersonaUpdateRequest,
-    user: UserContext = Depends(get_current_user),
-    persona_store: PersonaStorePort = Depends(get_persona_store),
-) -> PersonaConfig:
-    """Allows CEO/non-developers to update report tone dynamically without redeployment."""
-    updated = PersonaConfig(
-        tone_instructions=payload.tone_instructions,
-        updated_by=user.user_id,
-    )
-    return await persona_store.save_persona(updated)
-
-
-@router.get("/preferences", response_model=UserPreferenceProfile)
-async def get_preferences(
-    user: UserContext = Depends(get_current_user),
-    pref_store: UserPreferencePort = Depends(get_preference_store),
-) -> UserPreferenceProfile:
-    return await pref_store.get_preferences(user.user_id)
-
-
-@router.put("/preferences", response_model=UserPreferenceProfile)
-async def update_preferences(
-    profile: UserPreferenceProfile,
-    user: UserContext = Depends(get_current_user),
-    pref_store: UserPreferencePort = Depends(get_preference_store),
-) -> UserPreferenceProfile:
-    profile.user_id = user.user_id
-    return await pref_store.upsert_preferences(profile)
 
 
 @router.get("/metrics")
