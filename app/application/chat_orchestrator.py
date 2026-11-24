@@ -5,7 +5,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from typing import Any, TypedDict
 from uuid import uuid4
+
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 
 from app.application.ports import (
     AnalyticsWarehousePort,
@@ -17,6 +21,7 @@ from app.application.ports import (
 from app.application.report_service import ReportService
 from app.domain.exceptions import QueryExecutionError, SQLSafetyError
 from app.domain.models import (
+    AnalystSynthesis,
     ChatMessage,
     ChatRequest,
     ChatResponse,
@@ -25,6 +30,7 @@ from app.domain.models import (
     PersonaConfig,
     QueryExecutionResult,
     SavedReport,
+    SQLPlan,
     UserContext,
     UserPreferenceProfile,
 )
@@ -32,6 +38,23 @@ from app.domain.pii_masker import PIIMasker
 from app.domain.sql_policy import SQLPolicyEngine
 
 logger = logging.getLogger(__name__)
+
+
+class AnalysisWorkflowState(TypedDict, total=False):
+    user_message: str
+    user_context: UserContext
+    history: list[ChatMessage]
+    schema_summary: str
+    preferences: UserPreferenceProfile
+    trace_id: str
+    attempt: int
+    sql_plan: SQLPlan | None
+    query_result: QueryExecutionResult | None
+    synthesis: AnalystSynthesis | None
+    last_error: str | None
+    last_sql: str | None
+    fatal_error: Exception | None
+    redactions_count: int
 
 
 class ChatOrchestratorService:
@@ -64,6 +87,181 @@ class ChatOrchestratorService:
         self._max_sql_retries = max_sql_retries
         self._cache_ttl = cache_ttl_seconds
         self._chat_history_limit = chat_history_limit
+        self._analysis_graph = self._build_analysis_graph()
+
+    def _build_analysis_graph(self) -> CompiledStateGraph:
+        workflow = StateGraph(AnalysisWorkflowState)
+
+        async def generate_sql_node(state: AnalysisWorkflowState) -> dict[str, Any]:
+            t_sql = time.perf_counter()
+            attempt = state.get("attempt", 1)
+            trace_id = state.get("trace_id", "")
+            plan = await self._llm.generate_sql_plan(
+                user_message=state["user_message"],
+                schema_summary=state["schema_summary"],
+                user_context=state["user_context"],
+                history=state["history"],
+                previous_error=state.get("last_error"),
+                previous_sql=state.get("last_sql"),
+            )
+            if trace_id:
+                self._obs.record_span(
+                    trace_id,
+                    f"sql_generation_attempt_{attempt}",
+                    (time.perf_counter() - t_sql) * 1000,
+                    {"requires_sql": plan.requires_sql},
+                )
+            return {"sql_plan": plan}
+
+        async def execute_query_node(state: AnalysisWorkflowState) -> dict[str, Any]:
+            plan = state.get("sql_plan")
+            if plan is None or not plan.requires_sql:
+                return {"query_result": None}
+
+            attempt = state.get("attempt", 1)
+            trace_id = state.get("trace_id", "")
+            user = state["user_context"]
+
+            validation = self._sql_policy.validate_and_secure(plan.sql_query, user)
+            if not validation.is_valid:
+                error_msg = f"SQL Policy Violation: {'; '.join(validation.violations)}"
+                self._obs.increment_metric("sql_self_correction_attempts")
+                logger.warning("Attempt %d SQL policy rejected: %s", attempt, error_msg)
+                policy_fatal: Exception | None = (
+                    SQLSafetyError(error_msg) if attempt >= self._max_sql_retries else None
+                )
+                return {
+                    "last_error": error_msg,
+                    "last_sql": plan.sql_query,
+                    "attempt": attempt + 1,
+                    "fatal_error": policy_fatal,
+                }
+
+            secured_sql = validation.sanitized_sql
+            sql_hash = hashlib.sha256(secured_sql.encode("utf-8")).hexdigest()[:16]
+            cache_key = f"bq_cache:{sql_hash}"
+            cached_payload = await self._cache.get_json(cache_key)
+            if cached_payload is not None:
+                cached_result = QueryExecutionResult(
+                    **cached_payload, from_cache=True, attempts=attempt
+                )
+                masked_rows, row_redactions = self._masker.mask_rows(cached_result.rows)
+                self._obs.increment_metric("bq_cache_hits")
+                return {
+                    "query_result": cached_result.model_copy(update={"rows": masked_rows}),
+                    "last_sql": secured_sql,
+                    "redactions_count": state.get("redactions_count", 0) + row_redactions,
+                }
+
+            try:
+                t_bq = time.perf_counter()
+                raw_result = await self._warehouse.execute_query(secured_sql)
+                if trace_id:
+                    self._obs.record_span(
+                        trace_id,
+                        f"bigquery_execution_attempt_{attempt}",
+                        (time.perf_counter() - t_bq) * 1000,
+                        {"row_count": raw_result.row_count},
+                    )
+
+                if raw_result.row_count == 0 and attempt < self._max_sql_retries:
+                    err_msg = (
+                        "Query executed cleanly but returned 0 rows. Verify filter literals "
+                        "(e.g., case sensitivity, date ranges, or status values) and broaden filters if appropriate."
+                    )
+                    self._obs.increment_metric("sql_self_correction_attempts")
+                    return {
+                        "last_error": err_msg,
+                        "last_sql": secured_sql,
+                        "attempt": attempt + 1,
+                    }
+
+                masked_rows, row_redactions = self._masker.mask_rows(raw_result.rows)
+                result = QueryExecutionResult(
+                    sql_executed=secured_sql,
+                    rows=masked_rows,
+                    row_count=raw_result.row_count,
+                    columns=raw_result.columns,
+                    bytes_processed=raw_result.bytes_processed,
+                    from_cache=False,
+                    attempts=attempt,
+                )
+                await self._cache.set_json(
+                    cache_key,
+                    result.model_dump(exclude={"from_cache", "attempts"}),
+                    ttl_seconds=self._cache_ttl,
+                )
+                return {
+                    "query_result": result,
+                    "last_sql": secured_sql,
+                    "redactions_count": state.get("redactions_count", 0) + row_redactions,
+                }
+            except Exception as exc:
+                err_msg = str(exc)
+                self._obs.increment_metric("sql_self_correction_attempts")
+                logger.warning("Attempt %d BigQuery error: %s", attempt, err_msg)
+                exec_fatal: Exception | None = (
+                    QueryExecutionError(
+                        f"Unable to execute a valid analytical query after {self._max_sql_retries} attempts: {err_msg}",
+                        last_sql=secured_sql,
+                    )
+                    if attempt >= self._max_sql_retries
+                    else None
+                )
+                return {
+                    "last_error": err_msg,
+                    "last_sql": secured_sql,
+                    "attempt": attempt + 1,
+                    "fatal_error": exec_fatal,
+                }
+
+        async def synthesize_node(state: AnalysisWorkflowState) -> dict[str, Any]:
+            t_syn = time.perf_counter()
+            trace_id = state.get("trace_id", "")
+            synthesis = await self._llm.synthesize_response(
+                user_message=state["user_message"],
+                query_result=state.get("query_result"),
+                persona=self._persona,
+                preferences=state["preferences"],
+                history=state["history"],
+            )
+            if trace_id:
+                self._obs.record_span(
+                    trace_id,
+                    "executive_synthesis",
+                    (time.perf_counter() - t_syn) * 1000,
+                    {"has_action_items": len(synthesis.action_items) > 0},
+                )
+            return {"synthesis": synthesis}
+
+        def route_after_execution(state: AnalysisWorkflowState) -> str:
+            if state.get("fatal_error") is not None:
+                return END
+            sql_plan = state.get("sql_plan")
+            if state.get("query_result") is not None or (sql_plan and not sql_plan.requires_sql):
+                return "synthesize"
+            if state.get("last_error") and state.get("attempt", 1) <= self._max_sql_retries:
+                return "generate_sql"
+            return END
+
+        workflow.add_node("generate_sql", generate_sql_node)
+        workflow.add_node("execute_query", execute_query_node)
+        workflow.add_node("synthesize", synthesize_node)
+
+        workflow.add_edge(START, "generate_sql")
+        workflow.add_edge("generate_sql", "execute_query")
+        workflow.add_conditional_edges(
+            "execute_query",
+            route_after_execution,
+            {
+                "generate_sql": "generate_sql",
+                "synthesize": "synthesize",
+                END: END,
+            },
+        )
+        workflow.add_edge("synthesize", END)
+
+        return workflow.compile()
 
     async def confirm_action(self, request: ConfirmationRequest, user: UserContext) -> ChatResponse:
         trace_id = f"tr_{uuid4().hex[:12]}"
@@ -220,120 +418,29 @@ class ChatOrchestratorService:
             (time.perf_counter() - t_ret) * 1000,
         )
 
-        # 6. SQL Generation + Safety Validation + Self-Correction Retry Loop
-        query_result: QueryExecutionResult | None = None
-        last_error: str | None = None
-        last_sql: str | None = None
-        pii_redactions_total = 0
-
-        for attempt in range(1, self._max_sql_retries + 1):
-            t_sql = time.perf_counter()
-            sql_plan = await self._llm.generate_sql_plan(
-                user_message=request.message,
-                schema_summary=schema_summary,
-                user_context=user,
-                history=history,
-                previous_error=last_error,
-                previous_sql=last_sql,
-            )
-            self._obs.record_span(
-                trace_id,
-                f"sql_generation_attempt_{attempt}",
-                (time.perf_counter() - t_sql) * 1000,
-                {"requires_sql": sql_plan.requires_sql},
-            )
-
-            if not sql_plan.requires_sql:
-                break
-
-            validation = self._sql_policy.validate_and_secure(sql_plan.sql_query, user)
-            if not validation.is_valid:
-                last_error = f"SQL Policy Violation: {'; '.join(validation.violations)}"
-                last_sql = sql_plan.sql_query
-                self._obs.increment_metric("sql_self_correction_attempts")
-                logger.warning("Attempt %d SQL policy rejected: %s", attempt, last_error)
-                if attempt == self._max_sql_retries:
-                    raise SQLSafetyError(last_error)
-                continue
-
-            secured_sql = validation.sanitized_sql
-            last_sql = secured_sql
-
-            # Check Redis query cache first
-            sql_hash = hashlib.sha256(secured_sql.encode("utf-8")).hexdigest()[:16]
-            cache_key = f"bq_cache:{sql_hash}"
-            cached_payload = await self._cache.get_json(cache_key)
-            if cached_payload is not None:
-                cached_result = QueryExecutionResult(
-                    **cached_payload, from_cache=True, attempts=attempt
-                )
-                masked_rows, row_redactions = self._masker.mask_rows(cached_result.rows)
-                pii_redactions_total += row_redactions
-                query_result = cached_result.model_copy(update={"rows": masked_rows})
-                self._obs.increment_metric("bq_cache_hits")
-                break
-
-            try:
-                t_bq = time.perf_counter()
-                raw_result = await self._warehouse.execute_query(secured_sql)
-                self._obs.record_span(
-                    trace_id,
-                    f"bigquery_execution_attempt_{attempt}",
-                    (time.perf_counter() - t_bq) * 1000,
-                    {"row_count": raw_result.row_count},
-                )
-
-                # Self-correct on empty result set (e.g., overly strict filter or wrong state/category casing)
-                if raw_result.row_count == 0 and attempt < self._max_sql_retries:
-                    last_error = (
-                        "Query executed cleanly but returned 0 rows. Verify filter literals "
-                        "(e.g., case sensitivity, date ranges, or status values) and broaden filters if appropriate."
-                    )
-                    self._obs.increment_metric("sql_self_correction_attempts")
-                    continue
-
-                # Mandatory PII masking before caching or passing to LLM synthesis
-                masked_rows, row_redactions = self._masker.mask_rows(raw_result.rows)
-                pii_redactions_total += row_redactions
-                query_result = QueryExecutionResult(
-                    sql_executed=secured_sql,
-                    rows=masked_rows,
-                    row_count=raw_result.row_count,
-                    columns=raw_result.columns,
-                    bytes_processed=raw_result.bytes_processed,
-                    from_cache=False,
-                    attempts=attempt,
-                )
-                await self._cache.set_json(
-                    cache_key,
-                    query_result.model_dump(exclude={"from_cache", "attempts"}),
-                    ttl_seconds=self._cache_ttl,
-                )
-                break
-            except Exception as exc:
-                last_error = str(exc)
-                self._obs.increment_metric("sql_self_correction_attempts")
-                logger.warning("Attempt %d BigQuery error: %s", attempt, last_error)
-                if attempt == self._max_sql_retries:
-                    raise QueryExecutionError(
-                        f"Unable to execute a valid analytical query after {self._max_sql_retries} attempts: {last_error}",
-                        last_sql=last_sql,
-                    ) from exc
-
-        # 7. Executive Synthesis + Output PII Masking
-        t_syn = time.perf_counter()
-        synthesis = await self._llm.synthesize_response(
-            user_message=request.message,
-            query_result=query_result,
-            persona=self._persona,
-            preferences=prefs,
-            history=history,
+        # 6. LangGraph Workflow (SQL Generation + Safety Validation + Self-Correction Retry + Executive Synthesis)
+        workflow_state = await self._analysis_graph.ainvoke(
+            {
+                "user_message": request.message,
+                "user_context": user,
+                "history": history,
+                "schema_summary": schema_summary,
+                "preferences": prefs,
+                "trace_id": trace_id,
+                "attempt": 1,
+            }
         )
-        self._obs.record_span(
-            trace_id,
-            "executive_synthesis",
-            (time.perf_counter() - t_syn) * 1000,
-        )
+
+        fatal = workflow_state.get("fatal_error")
+        if fatal is not None:
+            raise fatal
+
+        query_result = workflow_state.get("query_result")
+        synthesis = workflow_state.get("synthesis")
+        if synthesis is None:
+            raise QueryExecutionError("Analysis workflow completed without synthesis output.")
+
+        pii_redactions_total = workflow_state.get("redactions_count", 0)
 
         combined_md = f"{synthesis.executive_summary}\n\n{synthesis.detailed_analysis}"
         if synthesis.action_items:

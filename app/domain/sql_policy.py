@@ -189,8 +189,9 @@ class SQLPolicyEngine:
         for select in query.find_all(exp.Select):
             select_demographics = [
                 column
-                for column in demographic_columns
-                if column.find_ancestor(exp.Select) is select
+                for projection in select.expressions
+                for column in projection.find_all(exp.Column)
+                if column.name.lower() in DEMOGRAPHIC_COLUMNS
             ]
             if not select_demographics:
                 continue
@@ -214,10 +215,7 @@ class SQLPolicyEngine:
                 for column in group_expression.find_all(exp.Column)
             }
             projected_demographics = {
-                column.sql(dialect="bigquery").lower()
-                for projection in select.expressions
-                for column in projection.find_all(exp.Column)
-                if column.name.lower() in DEMOGRAPHIC_COLUMNS
+                column.sql(dialect="bigquery").lower() for column in select_demographics
             }
             if not projected_demographics.issubset(grouped_columns):
                 violations.append(
