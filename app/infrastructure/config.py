@@ -3,9 +3,51 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
+import yaml
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def load_user_rbac_profiles(
+    config_path: str | Path = "configs/users_rbac.yaml",
+) -> dict[str, dict[str, Any]]:
+    """Load local user RBAC and brand mapping profiles.
+
+    Falls back to sensible built-in defaults if the file does not exist.
+    """
+    path = Path(config_path)
+    if path.is_file():
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+                if isinstance(data, dict) and "users" in data and isinstance(data["users"], dict):
+                    return data["users"]
+        except Exception:
+            pass
+
+    return {
+        "ceo": {
+            "user_id": "ceo_carol",
+            "display_name": "Carol (Executive CEO)",
+            "role": "ceo",
+            "allowed_brands": [],
+        },
+        "brand_manager_alice": {
+            "user_id": "mgr_alice",
+            "display_name": "Alice (Brand Manager - Calvin Klein)",
+            "role": "brand_manager",
+            "allowed_brands": ["Calvin Klein"],
+        },
+        "brand_manager_bob": {
+            "user_id": "mgr_bob",
+            "display_name": "Bob (Multi-Brand Manager)",
+            "role": "brand_manager",
+            "allowed_brands": ["Diesel", "Tommy Hilfiger"],
+        },
+    }
 
 
 class Settings(BaseSettings):
