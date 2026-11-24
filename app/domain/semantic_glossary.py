@@ -156,9 +156,16 @@ class SemanticGlossary:
                     self._metrics[key] = MetricDefinition(**val)
                 elif isinstance(val, str) and key in self._metrics:
                     existing = self._metrics[key]
-                    self._metrics[key] = existing.model_copy(
-                        update={"description": val, "business_rule": val}
-                    )
+                    update: dict[str, str] = {"description": val, "business_rule": val}
+                    if key == "churn_rate":
+                        churn_days = self._extract_churn_days(val.lower())
+                        if churn_days is not None:
+                            update["sql_formula"] = (
+                                "SAFE_DIVIDE(COUNT(DISTINCT churned_user_id), "
+                                "COUNT(DISTINCT total_user_id)) * 100 "
+                                f"(churned = no orders in past {churn_days} days)"
+                            )
+                    self._metrics[key] = existing.model_copy(update=update)
 
     @property
     def enabled(self) -> bool:

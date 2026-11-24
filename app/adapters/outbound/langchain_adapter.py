@@ -373,6 +373,8 @@ class LangChainRetailAgentAdapter:
 
     def _heuristic_sql_plan(self, user_message: str) -> SQLPlan:
         low = user_message.lower()
+        has_churn = "churn" in low or "отток" in low
+        has_returns = any(word in low for word in ("return", "cancel", "возврат", "отмен"))
         if "schema" in low or "what tables" in low or "what data is available" in low:
             return SQLPlan(
                 reasoning="User asked for database schema metadata; no BigQuery execution required.",
@@ -389,7 +391,44 @@ class LangChainRetailAgentAdapter:
                 f"GROUP BY u.state HAVING COUNT(DISTINCT u.id) >= {self._demographic_min_group_size} "
                 f"ORDER BY avg_spend_usd DESC LIMIT 20"
             )
-        elif "churn" in low or "отток" in low:
+        elif has_churn and ("return" in low or "возврат" in low):
+            churn_days = self._glossary.churn_inactivity_days(user_message)
+            sql = (
+                f"WITH customer_activity AS (\n"
+                f"  SELECT user_id, MAX(created_at) AS last_order_at\n"
+                f"  FROM `{self._dataset_id}.orders`\n"
+                f"  WHERE status = 'Complete'\n"
+                f"  GROUP BY user_id\n"
+                f"),\n"
+                f"churn AS (\n"
+                f"  SELECT COUNT(DISTINCT user_id) AS total_active_customers,\n"
+                f"    COUNT(DISTINCT CASE WHEN last_order_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {churn_days} DAY) THEN user_id END) AS churned_customers,\n"
+                f"    ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN last_order_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {churn_days} DAY) THEN user_id END), COUNT(DISTINCT user_id)) * 100, 2) AS churn_rate_pct\n"
+                f"  FROM customer_activity\n"
+                f"),\n"
+                f"return_trend AS (\n"
+                f"  SELECT FORMAT_TIMESTAMP('%Y-%m', created_at) AS month,\n"
+                f"    COUNTIF(status = 'Complete') AS completed_orders,\n"
+                f"    COUNTIF(status = 'Cancelled') AS cancelled_orders,\n"
+                f"    COUNTIF(status = 'Returned') AS returned_orders,\n"
+                f"    ROUND(SAFE_DIVIDE(COUNTIF(status IN ('Cancelled', 'Returned')), COUNT(*)) * 100, 2) AS return_cancel_rate_pct\n"
+                f"  FROM `{self._dataset_id}.orders`\n"
+                f"  GROUP BY month\n"
+                f")\n"
+                f"SELECT return_trend.month, return_trend.completed_orders, "
+                f"return_trend.cancelled_orders, return_trend.returned_orders, "
+                f"return_trend.return_cancel_rate_pct, churn.total_active_customers, "
+                f"churn.churned_customers, churn.churn_rate_pct\n"
+                f"FROM return_trend CROSS JOIN churn\n"
+                f"ORDER BY month DESC LIMIT 12"
+            )
+        elif "aov" in low or "average order value" in low or "basket size" in low:
+            sql = (
+                f"SELECT ROUND(SAFE_DIVIDE(SUM(sale_price), COUNT(DISTINCT order_id)), 2) AS aov_usd "
+                f"FROM `{self._dataset_id}.order_items` "
+                f"WHERE status = 'Complete'"
+            )
+        elif has_churn:
             churn_days = self._glossary.churn_inactivity_days(user_message)
             sql = (
                 f"WITH customer_activity AS (\n"
@@ -413,7 +452,7 @@ class LangChainRetailAgentAdapter:
                 f"WHERE oi.status != 'Cancelled' "
                 f"GROUP BY p.category, p.department ORDER BY revenue_usd DESC LIMIT 20"
             )
-        elif "return" in low or "cancel" in low or "возврат" in low or "отмен" in low:
+        elif has_returns:
             sql = (
                 f"SELECT FORMAT_TIMESTAMP('%Y-%m', created_at) AS month, "
                 f"COUNTIF(status = 'Complete') AS completed_orders, "

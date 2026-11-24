@@ -55,6 +55,7 @@ def test_semantic_glossary_custom_override() -> None:
     churn = glossary.get_metric("churn_rate")
     assert churn is not None
     assert "60 days" in churn.description
+    assert "past 60 days" in churn.sql_formula
 
     custom = glossary.get_metric("custom_kpi")
     assert custom is not None
@@ -323,8 +324,28 @@ def test_fallback_churn_uses_configured_threshold() -> None:
     adapter = LangChainRetailAgentAdapter(glossary=glossary)
 
     plan = adapter._heuristic_sql_plan("Calculate customer churn rate")
-
     assert "TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 45 DAY)" in plan.sql_query
+
+
+def test_fallback_aov_uses_completed_orders() -> None:
+    adapter = LangChainRetailAgentAdapter()
+
+    plan = adapter._heuristic_sql_plan("What is our average order value?")
+
+    assert "aov_usd" in plan.sql_query
+    assert "COUNT(DISTINCT order_id)" in plan.sql_query
+    assert "status = 'Complete'" in plan.sql_query
+
+
+def test_fallback_combines_churn_and_return_trend() -> None:
+    adapter = LangChainRetailAgentAdapter()
+
+    plan = adapter._heuristic_sql_plan("What is our churn rate and return trend?")
+
+    assert "churn_rate_pct" in plan.sql_query
+    assert "return_cancel_rate_pct" in plan.sql_query
+    assert "FROM return_trend CROSS JOIN churn" in plan.sql_query
+    assert "return_trend.*" not in plan.sql_query
 
 
 def test_fallback_revenue_including_returns_uses_revenue_query() -> None:
