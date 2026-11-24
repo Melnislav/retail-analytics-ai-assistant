@@ -14,7 +14,14 @@ from sqlglot import parse_one
 
 from app.adapters.inbound.http_api import get_current_user
 from app.adapters.outbound.langchain_adapter import LangChainRetailAgentAdapter, LLMProvider
-from app.domain.models import ChatMessage, GuardrailDecision, IntentType, UserContext, UserRole
+from app.domain.models import (
+    ChatMessage,
+    ChatRequest,
+    GuardrailDecision,
+    IntentType,
+    UserContext,
+    UserRole,
+)
 from app.domain.pii_masker import PIIMasker
 from app.domain.sql_policy import SQLPolicyEngine
 from app.infrastructure.config import Settings
@@ -192,6 +199,12 @@ def test_sql_policy_blocks_pii_alias_and_small_demographic_groups() -> None:
         "FROM users u GROUP BY u.city HAVING COUNT(DISTINCT u.id) >= 5",
         ceo,
     )
+    demographic_filtered_revenue = policy.validate_and_secure(
+        "SELECT SUM(oi.sale_price) AS total_revenue "
+        "FROM order_items oi JOIN users u ON oi.user_id = u.id "
+        "WHERE u.country = 'USA' AND u.state = 'CA'",
+        ceo,
+    )
 
     assert not aliased_pii.is_valid
     assert "even when renamed" in aliased_pii.violations[0]
@@ -202,6 +215,7 @@ def test_sql_policy_blocks_pii_alias_and_small_demographic_groups() -> None:
     assert not bypassed_demographics.is_valid
     assert any("minimum-size" in item or ">= 5" in item for item in unsafe_demographics.violations)
     assert safe_demographics.is_valid
+    assert demographic_filtered_revenue.is_valid
 
 
 def test_http_identity_uses_brands_and_rejects_unknown_roles() -> None:
@@ -309,3 +323,37 @@ def test_settings_and_container_wiring() -> None:
     assert container.sql_policy._default_limit == 150
     assert container.sql_policy._demographic_min_group_size == 7
     assert container.sql_policy._dataset_id == "custom-project.custom_retail_dataset"
+
+
+@pytest.mark.asyncio
+async def test_langgraph_sql_workflow_execution(tmp_path: Path) -> None:
+    test_settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test_opsfleet.db",
+        redis_url="redis://invalid-host-uses-memory-fallback:6379/0",
+        bigquery_mock_mode=True,
+        google_api_key="",
+        openai_api_key="",
+    )
+    container = ApplicationContainer(test_settings)
+    await container.startup()
+
+    try:
+        user = UserContext(
+            user_id="ceo_test",
+            display_name="CEO",
+            role=UserRole.CEO,
+            allowed_brands=[],
+        )
+        assert container.chat_orchestrator._analysis_graph is not None
+
+        response = await container.chat_orchestrator.handle_message(
+            ChatRequest(
+                session_id="test_langgraph_sess",
+                message="Show me top categories by sales",
+            ),
+            user,
+        )
+        assert response.reply
+        assert response.observability["sql_attempts"] >= 1
+    finally:
+        await container.shutdown()
