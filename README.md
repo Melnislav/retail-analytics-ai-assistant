@@ -43,5 +43,5 @@ Python 3.12, FastAPI, LangGraph/LangChain, Google BigQuery, PostgreSQL, Redis, S
 The documents below have distinct ownership to keep the project documentation free of duplicated requirements and architecture.
 
 - [Project goals, scope, and requirements](documentation/Retail%20assistant%20assessment.md)
-- [High-Level Design: architecture, Mermaid diagrams, data flows, and production decisions](documentation/high_level_design_hld_retail_data_analysis_chat_assistant.md)
+- [High-Level Design: architecture, Mermaid diagrams, data flows, and production decisions](documentation/high_level_design_HLD.md)
 - [AI-agent contribution contract](AGENTS.md)
