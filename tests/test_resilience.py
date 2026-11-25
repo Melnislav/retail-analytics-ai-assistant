@@ -11,7 +11,7 @@ from langchain_core.runnables import RunnableLambda
 
 from app.adapters.inbound.cli_client import RetailAssistantCLI
 from app.adapters.outbound.langchain_adapter import LangChainRetailAgentAdapter, LLMProvider
-from app.domain.models import GuardrailDecision, IntentType
+from app.domain.models import ChatMessage, GuardrailDecision, IntentType
 
 
 @pytest.mark.asyncio
@@ -59,6 +59,59 @@ async def test_langchain_all_failed_uses_heuristic() -> None:
 
     assert decision.intent == IntentType.BLOCKED_OFF_TOPIC
     assert decision.is_safe is False
+
+
+@pytest.mark.asyncio
+async def test_langchain_all_failed_fails_closed_for_non_retail_question() -> None:
+    adapter = LangChainRetailAgentAdapter()
+
+    async def fail(_messages: object) -> GuardrailDecision:
+        raise RuntimeError("total outage")
+
+    model = MagicMock()
+    model.with_structured_output.return_value = RunnableLambda(fail)
+    adapter._providers = [LLMProvider(name="primary", model=model)]
+
+    decision = await adapter.classify_and_guard("What is the capital of France?", [])
+
+    assert decision.intent == IntentType.BLOCKED_OFF_TOPIC
+    assert decision.is_safe is False
+    assert decision.rejection_reason is not None
+
+
+@pytest.mark.asyncio
+async def test_langchain_all_failed_allows_retail_question() -> None:
+    adapter = LangChainRetailAgentAdapter()
+
+    async def fail(_messages: object) -> GuardrailDecision:
+        raise RuntimeError("total outage")
+
+    model = MagicMock()
+    model.with_structured_output.return_value = RunnableLambda(fail)
+    adapter._providers = [LLMProvider(name="primary", model=model)]
+
+    decision = await adapter.classify_and_guard("What was revenue by brand last quarter?", [])
+
+    assert decision.intent == IntentType.DATA_ANALYSIS
+    assert decision.is_safe is True
+
+
+@pytest.mark.asyncio
+async def test_langchain_all_failed_allows_followup_with_history() -> None:
+    adapter = LangChainRetailAgentAdapter()
+
+    async def fail(_messages: object) -> GuardrailDecision:
+        raise RuntimeError("total outage")
+
+    model = MagicMock()
+    model.with_structured_output.return_value = RunnableLambda(fail)
+    adapter._providers = [LLMProvider(name="primary", model=model)]
+    history = [ChatMessage(role="assistant", content="Revenue by brand is trending up.")]
+
+    decision = await adapter.classify_and_guard("and by region?", history)
+
+    assert decision.intent == IntentType.DATA_ANALYSIS
+    assert decision.is_safe is True
 
 
 @pytest.mark.asyncio

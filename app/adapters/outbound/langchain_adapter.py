@@ -30,6 +30,20 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# Fail-closed signal set. When no LLM verdict is available, a message that mentions none of
+# these terms is refused instead of being silently treated as an analytical request.
+RETAIL_SIGNAL_PATTERN = re.compile(
+    r"\b(?:revenue|sales?|orders?|order_items|items?|units?|sold|products?|skus?|brands?|"
+    r"categor(?:y|ies)|customers?|users?|churn|retention|cohorts?|aov|ltv|gmv|margins?|"
+    r"profits?|baskets?|discounts?|campaigns?|prices?|pricing|refunds?|returns?|inventory|"
+    r"stock|shipping|fulfillment|stores?|channels?|conversion|funnel|traffic|sessions?|"
+    r"kpis?|metrics?|sql|schemas?|tables?|datasets?|bigquery|trends?|forecast|growth|"
+    r"spend|spending|quantity|amount|transactions?)\b"
+    r"|\b(?:выручк|продаж|заказ|товар|продукт|бренд|клиент|покупател|отток|маржинальн|"
+    r"прибыл|скидк|возврат|корзин|категор|склад|метрик|отч[её]т|таблиц|схем|показател)\w*",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class LLMProvider:
@@ -253,9 +267,9 @@ class LangChainRetailAgentAdapter:
         )
         if decision is not None:
             return decision
-        return self._heuristic_guardrail(user_message)
+        return self._heuristic_guardrail(user_message, has_history=bool(history))
 
-    def _heuristic_guardrail(self, text: str) -> GuardrailDecision:
+    def _heuristic_guardrail(self, text: str, has_history: bool = False) -> GuardrailDecision:
         low = text.lower()
         injection_markers = [
             "ignore previous",
@@ -313,6 +327,15 @@ class LangChainRetailAgentAdapter:
             )
 
         should_save = "create a report" in low or "save report" in low or "generate a report" in low
+        if not should_save and not has_history and not RETAIL_SIGNAL_PATTERN.search(low):
+            return GuardrailDecision(
+                intent=IntentType.BLOCKED_OFF_TOPIC,
+                is_safe=False,
+                rejection_reason=(
+                    "I can only answer retail analytics questions. Please name a metric, "
+                    "product, brand, customer segment, or reporting task."
+                ),
+            )
         return GuardrailDecision(
             intent=IntentType.DATA_ANALYSIS,
             is_safe=True,

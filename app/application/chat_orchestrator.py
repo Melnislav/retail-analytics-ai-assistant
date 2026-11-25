@@ -35,6 +35,7 @@ from app.domain.models import (
     UserPreferenceProfile,
 )
 from app.domain.pii_masker import PIIMasker
+from app.domain.safety_pre_guard import SafetyPreGuard
 from app.domain.semantic_glossary import SemanticGlossary
 from app.domain.sql_policy import SQLPolicyEngine
 
@@ -76,6 +77,7 @@ class ChatOrchestratorService:
         chat_history_limit: int = 10,
         default_persona_tone: str = PersonaConfig().tone_instructions,
         glossary: SemanticGlossary | None = None,
+        safety_pre_guard: SafetyPreGuard | None = None,
     ) -> None:
         self._llm = llm_agent
         self._warehouse = warehouse
@@ -90,6 +92,7 @@ class ChatOrchestratorService:
         self._cache_ttl = cache_ttl_seconds
         self._chat_history_limit = chat_history_limit
         self._glossary = glossary or SemanticGlossary()
+        self._pre_guard = safety_pre_guard or SafetyPreGuard()
         self._analysis_graph = self._build_analysis_graph()
 
     def _build_analysis_graph(self) -> CompiledStateGraph:
@@ -324,6 +327,38 @@ class ChatOrchestratorService:
         trace_id = f"tr_{uuid4().hex[:12]}"
         self._obs.start_trace(trace_id, user.user_id, request.session_id, request.message)
         self._obs.increment_metric("chat_requests_total")
+
+        # 0. Deterministic pre-guard (no LLM call): system commands, prompt injection, PII exfiltration.
+        t_pre = time.perf_counter()
+        pre_guard = self._pre_guard.check(request.message)
+        self._obs.record_span(
+            trace_id,
+            "pre_guard",
+            (time.perf_counter() - t_pre) * 1000,
+            {
+                "allowed": pre_guard.allowed,
+                "code": pre_guard.code.value if pre_guard.code else None,
+            },
+        )
+        if not pre_guard.allowed:
+            self._obs.increment_metric("pre_guard_blocks_total")
+            refusal = self._mask_text(
+                pre_guard.reason
+                or "I can only answer retail analytics questions and cannot process this request."
+            )
+            await self._cache.append_chat_message(
+                request.session_id, ChatMessage(role="assistant", content=refusal)
+            )
+            return ChatResponse(
+                session_id=request.session_id,
+                trace_id=trace_id,
+                reply=refusal,
+                observability={
+                    "trace_id": trace_id,
+                    "blocked": True,
+                    "pre_guard_code": pre_guard.code.value if pre_guard.code else None,
+                },
+            )
 
         history = await self._cache.get_chat_history(
             request.session_id, limit=self._chat_history_limit
