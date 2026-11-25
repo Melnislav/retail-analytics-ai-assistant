@@ -1,5 +1,7 @@
 # High-Level Design (HLD) — Retail Data Analysis Chat Assistant
 
+> **Document ownership.** This HLD is the authoritative source for the system architecture, data flows, technology choices, operational design, and Mermaid diagrams. The canonical project goals, scope, and acceptance requirements are in [Retail assistant assessment.md](Retail%20assistant%20assessment.md). Setup belongs in the [README](../README.md); AI-agent implementation rules belong in [AGENTS.md](../AGENTS.md).
+
 ## 1. Executive Summary & Architectural Principles
 
 The **Retail Data Analysis Chat Assistant** is an enterprise-grade AI solution designed for non-technical executive teams (e.g., retail managers and CEOs) to query complex retail transactional data using natural language. The system executes dynamic SQL queries against Google BigQuery's public dataset (`bigquery-public-data.thelook_ecommerce`), synthesizes actionable business insights, manages a library of saved executive reports, and exposes extensible hooks for future capabilities (e.g., automated charting, email distribution, web trend analysis).
@@ -18,7 +20,7 @@ The **Retail Data Analysis Chat Assistant** is an enterprise-grade AI solution d
 Per assessment guidelines (Deliverable #6), the technical stack was selected based on production reliability, strict domain isolation capabilities, and architectural fit.
 
 ### Stack Specification & Rationale
-1. **Core Language & Type System (Python 3.11+ & Pydantic v2):**
+1. **Core Language & Type System (Python 3.12+ & Pydantic v2):**
    * *Rationale:* Provides strong static typing, ultra-fast validation via Rust-based Pydantic core, and seamless interoperability with major AI/ML SDKs. Immutable value objects represent identity, security contexts, and analytical queries deterministically.
 2. **LLM Orchestration & Fallback Framework (LangChain / Core Expression Language - LCEL):**
    * *Rationale:* Offers lightweight abstraction over multi-provider LLM integrations (Google Gemini, OpenAI, Anthropic) via unified interfaces (`BaseChatModel`). Allows declarative fallback chains (`Runnable.with_fallbacks()`), structured output parsing (`with_structured_output()`), and provider neutrality without lock-in.
@@ -616,63 +618,24 @@ erDiagram
 
 ---
 
-## 10. Prototype Project Structure & Extension Ports
+## 10. Implemented Project Structure and Extension Ports
+
+The following is the repository layout implemented by the prototype. The named modules are the current extension seams; future charting, notification, and web-search capabilities should be introduced as application ports with outbound adapters rather than coupled to the domain.
 
 ```text
-retail-analytics-agent/
-├── src/
-│   ├── core/                        # Pure Application & Domain Core (Framework Agnostic)
-│   │   ├── domain/                  # Value Objects, Entities & Security Policies
-│   │   │   ├── privacy_policy.py    # Immutable PrivacyPolicy VO (PII lists, k-anonymity rules)
-│   │   │   ├── security_context.py  # User Identity, Role & Allowed Brand Claims
-│   │   │   ├── metrics_glossary.py  # Default & Session Metric Definitions
-│   │   │   └── report_entity.py     # SavedReport & DeletionProposal Domain Entities
-│   │   ├── services/                # Core Business Logic & Orchestration Services
-│   │   │   ├── orchestrator.py      # Main Agent Execution Loop & Budget Guard
-│   │   │   ├── sql_policy_engine.py # AST Parser, Brand CTE Rewriter, k-Anonymity Validation
-│   │   │   ├── post_sql_guard.py    # DataFrame Demographic Verification
-│   │   │   ├── pii_masker.py        # Column Scrubbing, Regex & HMAC Pseudonymization
-│   │   │   └── report_service.py    # Report Lifecycle & 2-Step Confirmation Engine
-│   │   └── ports/                   # Abstract Interfaces (Hexagonal Ports)
-│   │       ├── llm_port.py          # Abstract LLM Gateway Interface
-│   │       ├── database_port.py     # Abstract Query Execution Interface
-│   │       ├── storage_port.py      # Abstract Persistence Interface
-│   │       ├── tracer_port.py       # Abstract Observability Interface
-│   │       ├── visualization_port.py# Extension Port: Chart Spec Generator
-│   │       ├── notification_port.py # Extension Port: Report Email Dispatcher
-│   │       └── web_search_port.py   # Extension Port: External Trend Analysis
-│   │
-│   ├── adapters/                    # Outbound Driven Adapters
-│   │   ├── llm/
-│   │   │   └── llm_factory.py       # Gemini 2.5 Flash / OpenAI / Anthropic Factory + RateLimiter
-│   │   ├── database/
-│   │   │   └── bigquery_adapter.py  # Async BigQuery Runner + Dry-Run Byte Guard
-│   │   ├── storage/
-│   │   │   └── sqlite_adapter.py    # Local SQLite Adapter (Saved Reports, Proposals & Traces)
-│   │   └── observability/
-│   │       └── sqlite_tracer.py     # Local SQLite & Structured JSONL Tracing Adapter
-│   │
-│   └── inbound/                     # Inbound Driving Adapters
-│       └── cli/
-│           ├── app.py               # Rich CLI Interactive Loop
-│           └── formatting.py        # Terminal Tables, Progress Spinners & Markdown Renderers
-│
-├── configs/                         # Configuration Files
-│   ├── users_rbac.yaml              # Local User Identity & Brand Mappings
-│   ├── business_glossary.yaml       # Default Churn & Revenue Metric Formulas
-│   └── persona_config.yaml          # CEO Tone & Response Instructions
-│
-├── tests/                           # Security, Integration & Unit Tests
-│   ├── test_sql_policy_engine.py    # AST Security, Brand Isolation & Mutation Tests
-│   ├── test_pii_masker.py           # Zero-PII Scrubbing & HMAC Pseudonym Tests
-│   ├── test_report_service.py       # Deletion Confirmation Snapshot Tests
-│   └── test_resilience.py           # SQL Repair & Provider Fallback Tests
-│
-├── docs/                            # Architectural Documentation
-│   ├── high_level_design_hld.md     # Production High-Level Design (This Document)
-│   └── eval_set_example.md          # Reference Evaluation Dataset
-│
-├── requirements.txt                 # Python Dependencies (SQLGlot, LangChain, Pydantic, Rich)
-├── .env.example                     # Environment Variable Template
-└── README.md                        # Execution & Setup Instructions
+app/
+├── domain/                           # Models, semantic glossary, SQL policy, PII masking, exceptions
+├── application/                      # Ports, ChatOrchestrator, ReportService
+├── adapters/
+│   ├── inbound/                      # FastAPI HTTP API and Rich CLI client
+│   └── outbound/                     # BigQuery, LLM, persistence, Redis, telemetry adapters
+├── infrastructure/                   # Pydantic settings and composition root
+└── main.py                           # FastAPI entrypoint
+configs/users_rbac.yaml               # Local user-to-brand mapping
+tests/                                # Prototype, CLI/RBAC, resilience, and glossary verification
+documentation/                        # Requirements and this HLD
+docker-compose.yml                    # API, PostgreSQL, Redis, and optional CLI profile
+pyproject.toml / uv.lock              # Python project and resolved dependencies
+README.md                             # Human setup and quick start
+AGENTS.md                             # AI-agent contribution contract
 ```
