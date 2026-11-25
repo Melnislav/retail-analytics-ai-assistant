@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.application.chat_orchestrator import ChatOrchestratorService
 from app.application.ports import ObservabilityPort
@@ -21,34 +21,14 @@ from app.domain.models import (
     ConfirmationRequest,
     SavedReport,
     UserContext,
-    UserRole,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["Retail Data Analysis Assistant"])
 
 
-def get_current_user(
-    x_user_id: str = Header(default="manager_alice", alias="X-User-Id"),
-    x_user_name: str = Header(default="Alice (Brand Manager)", alias="X-User-Name"),
-    x_user_role: str = Header(default="brand_manager", alias="X-User-Role"),
-    x_allowed_brands: str = Header(default="", alias="X-Allowed-Brands"),
-) -> UserContext:
-    """Extracts user identity and brand permissions from trusted request headers."""
-    try:
-        role = UserRole(x_user_role.lower())
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Unknown user role; access denied.",
-        ) from exc
-
-    brands = [brand.strip() for brand in x_allowed_brands.split(",") if brand.strip()]
-    return UserContext(
-        user_id=x_user_id,
-        display_name=x_user_name,
-        role=role,
-        allowed_brands=brands,
-    )
+def get_current_user(request: Request) -> UserContext:
+    """Return the server-controlled prototype identity, never caller-supplied authority."""
+    return request.app.state.container.prototype_user
 
 
 def get_orchestrator(request: Request) -> ChatOrchestratorService:

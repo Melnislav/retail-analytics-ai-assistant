@@ -20,6 +20,7 @@ from app.application.ports import (
 )
 from app.application.report_service import ReportService
 from app.domain.exceptions import QueryExecutionError, SQLSafetyError
+from app.domain.input_safety import InputSafetyPolicy
 from app.domain.models import (
     AnalystSynthesis,
     ChatMessage,
@@ -35,7 +36,7 @@ from app.domain.models import (
     UserPreferenceProfile,
 )
 from app.domain.pii_masker import PIIMasker
-from app.domain.safety_pre_guard import SafetyPreGuard
+from app.domain.post_sql_guard import PostSQLDataGuard
 from app.domain.semantic_glossary import SemanticGlossary
 from app.domain.sql_policy import SQLPolicyEngine
 
@@ -77,7 +78,8 @@ class ChatOrchestratorService:
         chat_history_limit: int = 10,
         default_persona_tone: str = PersonaConfig().tone_instructions,
         glossary: SemanticGlossary | None = None,
-        safety_pre_guard: SafetyPreGuard | None = None,
+        input_safety: InputSafetyPolicy | None = None,
+        post_sql_guard: PostSQLDataGuard | None = None,
     ) -> None:
         self._llm = llm_agent
         self._warehouse = warehouse
@@ -92,7 +94,8 @@ class ChatOrchestratorService:
         self._cache_ttl = cache_ttl_seconds
         self._chat_history_limit = chat_history_limit
         self._glossary = glossary or SemanticGlossary()
-        self._pre_guard = safety_pre_guard or SafetyPreGuard()
+        self._input_safety = input_safety or InputSafetyPolicy()
+        self._post_sql_guard = post_sql_guard or PostSQLDataGuard()
         self._analysis_graph = self._build_analysis_graph()
 
     def _build_analysis_graph(self) -> CompiledStateGraph:
@@ -156,12 +159,15 @@ class ChatOrchestratorService:
                     cached_result = cached_result.model_copy(
                         update={"applied_metric_definitions": applied_defs}
                     )
-                masked_rows, row_redactions = self._masker.mask_rows(cached_result.rows)
+                guarded_rows, guard_redactions = self._apply_post_sql_guard(cached_result.rows)
+                masked_rows, row_redactions = self._masker.mask_rows(guarded_rows)
                 self._obs.increment_metric("bq_cache_hits")
                 return {
                     "query_result": cached_result.model_copy(update={"rows": masked_rows}),
                     "last_sql": secured_sql,
-                    "redactions_count": state.get("redactions_count", 0) + row_redactions,
+                    "redactions_count": (
+                        state.get("redactions_count", 0) + guard_redactions + row_redactions
+                    ),
                 }
 
             try:
@@ -187,7 +193,8 @@ class ChatOrchestratorService:
                         "attempt": attempt + 1,
                     }
 
-                masked_rows, row_redactions = self._masker.mask_rows(raw_result.rows)
+                guarded_rows, guard_redactions = self._apply_post_sql_guard(raw_result.rows)
+                masked_rows, row_redactions = self._masker.mask_rows(guarded_rows)
                 result = QueryExecutionResult(
                     sql_executed=secured_sql,
                     rows=masked_rows,
@@ -206,7 +213,9 @@ class ChatOrchestratorService:
                 return {
                     "query_result": result,
                     "last_sql": secured_sql,
-                    "redactions_count": state.get("redactions_count", 0) + row_redactions,
+                    "redactions_count": (
+                        state.get("redactions_count", 0) + guard_redactions + row_redactions
+                    ),
                 }
             except Exception as exc:
                 err_msg = str(exc)
@@ -325,26 +334,33 @@ class ChatOrchestratorService:
     async def handle_message(self, request: ChatRequest, user: UserContext) -> ChatResponse:
         t_start = time.perf_counter()
         trace_id = f"tr_{uuid4().hex[:12]}"
-        self._obs.start_trace(trace_id, user.user_id, request.session_id, request.message)
+        safe_message = self._mask_text(request.message)
+        self._obs.start_trace(trace_id, user.user_id, request.session_id, safe_message)
         self._obs.increment_metric("chat_requests_total")
 
-        # 0. Deterministic pre-guard (no LLM call): system commands, prompt injection, PII exfiltration.
+        raw_history = await self._cache.get_chat_history(
+            request.session_id, limit=self._chat_history_limit
+        )
+        history = [
+            message.model_copy(update={"content": self._mask_text(message.content)})
+            for message in raw_history
+        ]
+        await self._cache.append_chat_message(
+            request.session_id, ChatMessage(role="user", content=safe_message)
+        )
+
         t_pre = time.perf_counter()
-        pre_guard = self._pre_guard.check(request.message)
+        pre_guard = self._input_safety.inspect(request.message)
         self._obs.record_span(
             trace_id,
             "pre_guard",
             (time.perf_counter() - t_pre) * 1000,
-            {
-                "allowed": pre_guard.allowed,
-                "code": pre_guard.code.value if pre_guard.code else None,
-            },
+            {"is_safe": pre_guard.is_safe},
         )
-        if not pre_guard.allowed:
-            self._obs.increment_metric("pre_guard_blocks_total")
+        if not pre_guard.is_safe:
+            self._obs.increment_metric("deterministic_guardrail_blocks_total")
             refusal = self._mask_text(
-                pre_guard.reason
-                or "I can only answer retail analytics questions and cannot process this request."
+                pre_guard.rejection_reason or "Request blocked by security policy."
             )
             await self._cache.append_chat_message(
                 request.session_id, ChatMessage(role="assistant", content=refusal)
@@ -353,23 +369,12 @@ class ChatOrchestratorService:
                 session_id=request.session_id,
                 trace_id=trace_id,
                 reply=refusal,
-                observability={
-                    "trace_id": trace_id,
-                    "blocked": True,
-                    "pre_guard_code": pre_guard.code.value if pre_guard.code else None,
-                },
+                observability={"trace_id": trace_id, "blocked": True, "pre_guard": True},
             )
-
-        history = await self._cache.get_chat_history(
-            request.session_id, limit=self._chat_history_limit
-        )
-        await self._cache.append_chat_message(
-            request.session_id, ChatMessage(role="user", content=request.message)
-        )
 
         # 1. Safety Guardrail & Intent Classification
         t0 = time.perf_counter()
-        decision = await self._llm.classify_and_guard(request.message, history)
+        decision = await self._llm.classify_and_guard(safe_message, history)
         self._obs.record_span(
             trace_id,
             "guardrail_classification",
@@ -472,7 +477,7 @@ class ChatOrchestratorService:
         # 6. LangGraph Workflow (SQL Generation + Safety Validation + Self-Correction Retry + Executive Synthesis)
         workflow_state = await self._analysis_graph.ainvoke(
             {
-                "user_message": request.message,
+                "user_message": safe_message,
                 "user_context": user,
                 "history": history,
                 "schema_summary": schema_summary,
@@ -505,7 +510,7 @@ class ChatOrchestratorService:
             used_metrics_list = list(query_result.applied_metric_definitions)
         if not has_clarification and not used_metrics_list:
             detected = self._glossary.detect_metrics(
-                request.message + " " + (query_result.sql_executed if query_result else "")
+                safe_message + " " + (query_result.sql_executed if query_result else "")
             )
             used_metrics_list = [
                 f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in detected
@@ -513,7 +518,7 @@ class ChatOrchestratorService:
         combined_md = f"{synthesis.executive_summary}\n\n{synthesis.detailed_analysis}"
         if used_metrics_list and "Metric Definitions Applied" not in combined_md:
             detected_metrics = self._glossary.detect_metrics(
-                request.message + " " + (query_result.sql_executed if query_result else "")
+                safe_message + " " + (query_result.sql_executed if query_result else "")
             )
             defs_block = self._glossary.format_response_definitions(detected_metrics or None)
             if defs_block:
@@ -534,7 +539,7 @@ class ChatOrchestratorService:
         saved_report_id: str | None = None
         if request.save_report or decision.should_save_report:
             report_title = self._mask_text(
-                synthesis.report_title or f"Retail Analysis: {request.message[:60]}"
+                synthesis.report_title or f"Retail Analysis: {safe_message[:60]}"
             )
             safe_sql = self._mask_text(query_result.sql_executed) if query_result else None
             saved = await self._reports.save_report(
@@ -573,6 +578,20 @@ class ChatOrchestratorService:
                 "from_cache": query_result.from_cache if query_result else False,
                 "pii_redactions": pii_redactions_total,
             },
+        )
+
+    def _apply_post_sql_guard(self, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+        """Enforce demographic k-anonymity and non-linkage before caching or masking."""
+        guard_result = self._post_sql_guard.enforce(rows)
+        if guard_result.masked_groups_count > 0:
+            self._obs.increment_metric("k_anonymity_masks_total", guard_result.masked_groups_count)
+        if guard_result.stripped_demographic_cells > 0:
+            self._obs.increment_metric(
+                "demographic_link_redactions_total", guard_result.stripped_demographic_cells
+            )
+        return (
+            guard_result.rows,
+            guard_result.masked_groups_count + guard_result.stripped_demographic_cells,
         )
 
     def _mask_text(self, text: str) -> str:

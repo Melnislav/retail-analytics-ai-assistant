@@ -211,7 +211,10 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     """Inbound chat request payload."""
 
-    session_id: str = Field(default_factory=lambda: f"sess_{uuid4().hex[:10]}")
+    session_id: str = Field(
+        default_factory=lambda: f"sess_{uuid4().hex[:10]}",
+        pattern=r"^[A-Za-z0-9_-]{1,128}$",
+    )
     message: str = Field(..., min_length=1, max_length=4000)
     save_report: bool = Field(
         default=False,
@@ -222,8 +225,8 @@ class ChatRequest(BaseModel):
 class ConfirmationRequest(BaseModel):
     """Inbound payload to approve or cancel a high-stakes destructive action."""
 
-    session_id: str
-    token: str
+    session_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    token: str = Field(pattern=r"^confirm_[A-Za-z0-9]+$")
     approved: bool
 
 

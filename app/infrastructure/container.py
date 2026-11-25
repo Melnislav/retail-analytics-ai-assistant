@@ -12,9 +12,11 @@ from app.adapters.outbound.redis_and_telemetry import (
 from app.application.chat_orchestrator import ChatOrchestratorService
 from app.application.report_service import ReportService
 from app.domain.pii_masker import PIIMasker
+from app.domain.post_sql_guard import PostSQLDataGuard
+from app.domain.privacy_policy import PrivacyPolicy
 from app.domain.semantic_glossary import SemanticGlossary
 from app.domain.sql_policy import SQLPolicyEngine
-from app.infrastructure.config import Settings
+from app.infrastructure.config import Settings, resolve_local_user_context
 
 
 class ApplicationContainer:
@@ -22,6 +24,9 @@ class ApplicationContainer:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        # HTTP prototype requests use this server-controlled identity. The standalone CLI resolves
+        # its selected profile with the same function before entering the application core.
+        self.prototype_user = resolve_local_user_context(settings.prototype_user_profile)
         self.db_manager = DatabaseManager(settings.database_url)
         self.redis_adapter = AsyncRedisAdapter(
             redis_url=settings.redis_url,
@@ -43,11 +48,16 @@ class ApplicationContainer:
             enabled=settings.enable_semantic_glossary,
             clarification_messages=settings.metric_clarification_messages,
         )
-        self.pii_masker = PIIMasker(salt=settings.pii_salt)
+        self.privacy_policy = PrivacyPolicy(
+            demographic_min_group_size=settings.demographic_min_group_size
+        )
+        self.pii_masker = PIIMasker(salt=settings.pii_salt, policy=self.privacy_policy)
+        self.post_sql_guard = PostSQLDataGuard(policy=self.privacy_policy)
         self.sql_policy = SQLPolicyEngine(
             dataset_id=settings.bq_dataset_id,
             default_limit=settings.default_row_limit,
             demographic_min_group_size=settings.demographic_min_group_size,
+            privacy_policy=self.privacy_policy,
         )
 
         # Warehouse & LLM Adapters
@@ -95,6 +105,7 @@ class ApplicationContainer:
             chat_history_limit=settings.chat_history_limit,
             default_persona_tone=settings.default_persona_tone,
             glossary=self.glossary,
+            post_sql_guard=self.post_sql_guard,
         )
 
     async def startup(self) -> None:

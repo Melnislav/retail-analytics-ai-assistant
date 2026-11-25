@@ -10,6 +10,8 @@ import yaml
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.domain.models import UserContext, UserRole
+
 
 def load_user_rbac_profiles(
     config_path: str | Path = "configs/users_rbac.yaml",
@@ -48,6 +50,26 @@ def load_user_rbac_profiles(
             "allowed_brands": ["Diesel", "Tommy Hilfiger"],
         },
     }
+
+
+def resolve_local_user_context(
+    profile_key: str,
+    config_path: str | Path = "configs/users_rbac.yaml",
+) -> UserContext:
+    """Resolve a prototype identity exclusively from the local RBAC configuration."""
+    profile = load_user_rbac_profiles(config_path).get(profile_key)
+    if not isinstance(profile, dict):
+        raise ValueError(f"Unknown local RBAC profile: {profile_key}")
+
+    try:
+        return UserContext(
+            user_id=str(profile["user_id"]),
+            display_name=str(profile.get("display_name", "Executive User")),
+            role=UserRole(str(profile["role"]).lower()),
+            allowed_brands=[str(brand) for brand in profile.get("allowed_brands", [])],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid local RBAC profile: {profile_key}") from exc
 
 
 class Settings(BaseSettings):
@@ -110,6 +132,9 @@ class Settings(BaseSettings):
     chat_history_limit: int = Field(default=10, validation_alias="CHAT_HISTORY_LIMIT")
     chat_history_ttl_seconds: int = Field(
         default=86400, validation_alias="CHAT_HISTORY_TTL_SECONDS"
+    )
+    prototype_user_profile: str = Field(
+        default="brand_manager_alice", validation_alias="PROTOTYPE_USER_PROFILE"
     )
     # Data Protection & PII
     pii_salt: str = Field(default="retail-pii-salt-2026", validation_alias="PII_SALT")

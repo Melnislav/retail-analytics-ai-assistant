@@ -48,10 +48,9 @@ def test_cli_client_profile_initialization() -> None:
     assert cli_ceo.user_context.allowed_brands == []
 
 
-def test_cli_client_headers_contain_rbac_details() -> None:
+def test_cli_client_resolves_rbac_details_without_authority_headers() -> None:
     cli = RetailAssistantCLI(user_key="brand_manager_bob")
-    headers = cli.headers
-    assert headers["X-User-Id"] == "mgr_bob"
-    assert headers["X-User-Role"] == "brand_manager"
-    assert "Diesel" in headers["X-Allowed-Brands"]
-    assert "Tommy Hilfiger" in headers["X-Allowed-Brands"]
+    assert cli.headers == {}
+    assert cli.user_context.user_id == "mgr_bob"
+    assert cli.user_context.role.value == "brand_manager"
+    assert cli.user_context.allowed_brands == ["Diesel", "Tommy Hilfiger"]

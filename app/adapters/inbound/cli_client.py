@@ -15,8 +15,12 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from app.domain.models import ChatRequest, ConfirmationRequest, UserContext, UserRole
-from app.infrastructure.config import get_settings, load_user_rbac_profiles
+from app.domain.models import ChatRequest, ConfirmationRequest, UserContext
+from app.infrastructure.config import (
+    get_settings,
+    load_user_rbac_profiles,
+    resolve_local_user_context,
+)
 
 if TYPE_CHECKING:
     from app.infrastructure.container import ApplicationContainer
@@ -39,42 +43,27 @@ class RetailAssistantCLI:
         self.container: ApplicationContainer | None = None
 
         profiles = load_user_rbac_profiles()
-        selected_profile = None
-        if user_key and user_key in profiles:
-            selected_profile = profiles[user_key]
-        elif not user_key and "brand_manager_alice" in profiles:
-            selected_profile = profiles["brand_manager_alice"]
-
-        if selected_profile:
-            self.user_id = selected_profile["user_id"]
-            self.user_name = selected_profile["display_name"]
-            self.user_role = selected_profile["role"]
-            self.allowed_brands = ",".join(selected_profile.get("allowed_brands", []))
-        else:
-            self.user_id = os.getenv("CLI_USER_ID", "manager_alice")
-            self.user_name = os.getenv("CLI_USER_NAME", "Alice (Brand Manager)")
-            self.user_role = os.getenv("CLI_USER_ROLE", "brand_manager")
-            self.allowed_brands = os.getenv("CLI_ALLOWED_BRANDS", "")
+        self.profile_key = user_key or "brand_manager_alice"
+        if self.profile_key not in profiles:
+            raise ValueError(f"Unknown local RBAC profile: {self.profile_key}")
+        self._apply_profile(self.profile_key)
 
     @property
     def headers(self) -> dict[str, str]:
-        return {
-            "X-User-Id": self.user_id,
-            "X-User-Name": self.user_name,
-            "X-User-Role": self.user_role,
-            "X-Allowed-Brands": self.allowed_brands,
-        }
+        """No caller-controlled identity headers are sent to the prototype HTTP API."""
+        return {}
 
     @property
     def user_context(self) -> UserContext:
-        brands = [b.strip() for b in self.allowed_brands.split(",") if b.strip()]
-        role = UserRole.CEO if self.user_role.lower() == "ceo" else UserRole.BRAND_MANAGER
-        return UserContext(
-            user_id=self.user_id,
-            display_name=self.user_name,
-            role=role,
-            allowed_brands=brands,
-        )
+        return resolve_local_user_context(self.profile_key)
+
+    def _apply_profile(self, profile_key: str) -> None:
+        profile = resolve_local_user_context(profile_key)
+        self.profile_key = profile_key
+        self.user_id = profile.user_id
+        self.user_name = profile.display_name
+        self.user_role = profile.role.value
+        self.allowed_brands = ",".join(profile.allowed_brands)
 
     def print_banner(self) -> None:
         app_title = os.getenv("APP_NAME", "Retail Data Analysis Assistant")
@@ -109,7 +98,6 @@ class RetailAssistantCLI:
                 "[bold yellow]Available Commands:[/bold yellow]\n"
                 "• [bold]/users[/bold] - List available RBAC profiles from configs/users_rbac.yaml\n"
                 "• [bold]/user <name>[/bold] - Switch persona (e.g. /user ceo or /user alice)\n"
-                "• [bold]/role <role> [brands][/bold] - Custom role switch (e.g. /role brand_manager Nike)\n"
                 "• [bold]/clear[/bold] - Reset session conversation memory\n"
                 "• [bold]/reports[/bold] - List your saved reports\n"
                 "• [bold]/save <query>[/bold] - Ask question and save executive report\n"
@@ -312,10 +300,8 @@ class RetailAssistantCLI:
                                 match = v
                                 break
                     if match:
-                        self.user_id = match["user_id"]
-                        self.user_name = match["display_name"]
-                        self.user_role = match["role"]
-                        self.allowed_brands = ",".join(match.get("allowed_brands", []))
+                        matched_key = next(key for key, value in profiles.items() if value is match)
+                        self._apply_profile(matched_key)
                         console.print(
                             f"[green]Switched active user to [bold]{self.user_name}[/bold] "
                             f"(`{self.user_id}`, role=`{self.user_role}`, brands=`{self.allowed_brands or 'ALL'}`)[/green]"
@@ -331,12 +317,9 @@ class RetailAssistantCLI:
                     continue
 
                 if text.lower().startswith("/role "):
-                    parts = text.split(maxsplit=2)
-                    self.user_role = parts[1]
-                    self.allowed_brands = parts[2] if len(parts) > 2 else ""
                     console.print(
-                        f"[yellow]Switched role to `{self.user_role}` "
-                        f"(brands: `{self.allowed_brands or 'NONE'}`)[/yellow]"
+                        "[yellow]Role overrides are disabled. Use /users then /user <profile> "
+                        "to select a configured local profile.[/yellow]"
                     )
                     continue
 

@@ -7,33 +7,14 @@ from sqlglot import exp
 from sqlglot.errors import ParseError
 
 from app.domain.models import SQLValidationResult, UserContext, UserRole
+from app.domain.privacy_policy import DEFAULT_PRIVACY_POLICY, PrivacyPolicy
 
 ALLOWED_TABLES = frozenset({"orders", "order_items", "products", "users"})
 INTERNAL_CTES = frozenset(
     {"__allowed_products", "__scoped_order_items", "__scoped_orders", "__scoped_users"}
 )
-FORBIDDEN_PII_COLUMNS = frozenset(
-    {
-        "email",
-        "first_name",
-        "last_name",
-        "full_name",
-        "street_address",
-        "address",
-        "postal_code",
-        "zip",
-        "zipcode",
-        "latitude",
-        "longitude",
-        "user_geom",
-        "coordinates",
-        "ip_address",
-        "phone",
-        "phone_number",
-        "ssn",
-    }
-)
-DEMOGRAPHIC_COLUMNS = frozenset({"age", "gender", "city", "state", "country", "traffic_source"})
+FORBIDDEN_PII_COLUMNS = DEFAULT_PRIVACY_POLICY.pii_columns
+DEMOGRAPHIC_COLUMNS = DEFAULT_PRIVACY_POLICY.demographic_columns
 
 
 class SQLPolicyEngine:
@@ -44,10 +25,14 @@ class SQLPolicyEngine:
         dataset_id: str = "bigquery-public-data.thelook_ecommerce",
         default_limit: int = 200,
         demographic_min_group_size: int = 5,
+        privacy_policy: PrivacyPolicy | None = None,
     ) -> None:
         self._dataset_id = dataset_id
         self._default_limit = default_limit
-        self._demographic_min_group_size = demographic_min_group_size
+        self._policy = privacy_policy or PrivacyPolicy(
+            demographic_min_group_size=demographic_min_group_size
+        )
+        self._demographic_min_group_size = self._policy.demographic_min_group_size
         dataset_parts = dataset_id.split(".")
         if len(dataset_parts) != 2:
             raise ValueError("dataset_id must use '<project>.<dataset>' format")
@@ -153,7 +138,7 @@ class SQLPolicyEngine:
             {
                 column.name.lower()
                 for column in query.find_all(exp.Column)
-                if column.name.lower() in FORBIDDEN_PII_COLUMNS
+                if self._policy.is_pii_column(column.name)
             }
         )
         if forbidden_columns:
@@ -174,7 +159,7 @@ class SQLPolicyEngine:
         demographic_columns = [
             column
             for column in query.find_all(exp.Column)
-            if column.name.lower() in DEMOGRAPHIC_COLUMNS
+            if self._policy.is_demographic_column(column.name)
         ]
         if not demographic_columns:
             return []
@@ -186,12 +171,47 @@ class SQLPolicyEngine:
             if table.name.lower() == "users" and table.alias_or_name
         }
 
+        linkage_blocked = False
         for select in query.find_all(exp.Select):
+            is_outer_select = select.find_ancestor(exp.CTE, exp.Subquery) is None
+            select_touches_demographics = any(
+                self._policy.is_demographic_column(col.name)
+                and col.find_ancestor(exp.Select) is select
+                for col in select.find_all(exp.Column)
+            )
+            if not linkage_blocked and (is_outer_select or select_touches_demographics):
+                has_users_table = any(
+                    t.name.lower() == "users" and t.find_ancestor(exp.Select) is select
+                    for t in select.find_all(exp.Table)
+                )
+                for projection in select.expressions:
+                    if any(
+                        col.find_ancestor(exp.Select) is select
+                        and col.find_ancestor(exp.AggFunc) is None
+                        and (
+                            self._policy.is_user_identifier_column(col.name)
+                            or (
+                                col.name.lower() == "id"
+                                and (
+                                    col.table.lower() in users_aliases
+                                    or (not col.table and has_users_table)
+                                )
+                            )
+                        )
+                        for col in projection.find_all(exp.Column)
+                    ):
+                        violations.append(
+                            "Queries must not associate customer identifiers with demographic attributes."
+                        )
+                        linkage_blocked = True
+                        break
+
             select_demographics = [
                 column
                 for projection in select.expressions
                 for column in projection.find_all(exp.Column)
-                if column.name.lower() in DEMOGRAPHIC_COLUMNS
+                if self._policy.is_demographic_column(column.name)
+                and column.find_ancestor(exp.Select) is select
             ]
             if not select_demographics:
                 continue
@@ -257,7 +277,9 @@ class SQLPolicyEngine:
             if len(columns) != 1:
                 continue
             column = columns[0]
-            if column.name.lower() == "id" and column.table.lower() in users_aliases:
+            if (
+                column.name.lower() == "id" and column.table.lower() in users_aliases
+            ) or self._policy.is_user_identifier_column(column.name):
                 return True
         return False
 
@@ -292,8 +314,12 @@ class SQLPolicyEngine:
             "INNER JOIN __allowed_products AS p ON oi.product_id = p.id"
             "), "
             "__scoped_orders AS ("
-            f"SELECT o.* FROM `{self._dataset_id}.orders` AS o WHERE EXISTS ("
-            "SELECT 1 FROM __scoped_order_items AS oi WHERE oi.order_id = o.order_id)"
+            "SELECT o.order_id, o.user_id, o.status, o.gender, o.created_at, "
+            "o.returned_at, o.shipped_at, o.delivered_at, COUNT(oi.id) AS num_of_item "
+            f"FROM `{self._dataset_id}.orders` AS o "
+            "INNER JOIN __scoped_order_items AS oi ON oi.order_id = o.order_id "
+            "GROUP BY o.order_id, o.user_id, o.status, o.gender, o.created_at, "
+            "o.returned_at, o.shipped_at, o.delivered_at"
             "), "
             "__scoped_users AS ("
             f"SELECT u.* FROM `{self._dataset_id}.users` AS u WHERE EXISTS ("
