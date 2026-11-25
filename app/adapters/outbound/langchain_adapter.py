@@ -221,6 +221,9 @@ class LangChainRetailAgentAdapter:
         task_name: str,
     ) -> T | None:
         if not self._providers:
+            budget = get_active_turn_budget()
+            if budget is not None:
+                budget.record_fallback()
             return None
 
         safe_messages = self._mask_messages(messages)
@@ -258,6 +261,9 @@ class LangChainRetailAgentAdapter:
             "Falling back to deterministic heuristic rules during %s.",
             task_name,
         )
+        budget = get_active_turn_budget()
+        if budget is not None:
+            budget.record_fallback()
         return None
 
     def _mask_messages(

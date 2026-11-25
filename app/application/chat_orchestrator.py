@@ -39,6 +39,7 @@ from app.domain.models import (
     QueryExecutionResult,
     SavedReport,
     SQLPlan,
+    TraceRecord,
     UserContext,
     UserPreferenceProfile,
 )
@@ -62,6 +63,7 @@ class AnalysisWorkflowState(TypedDict, total=False):
     syntax_retries: int
     empty_retries: int
     budget: TurnBudget
+    trace_meta: dict[str, Any]
     sql_plan: SQLPlan | None
     query_result: QueryExecutionResult | None
     synthesis: AnalystSynthesis | None
@@ -157,6 +159,12 @@ class ChatOrchestratorService:
             max_additional_attempts = max(0, self._max_sql_retries - 1)
 
             validation = self._sql_policy.validate_and_secure(plan.sql_query, user)
+            trace_meta = state.get("trace_meta")
+            if trace_meta is not None:
+                trace_meta["generated_sql"] = (
+                    validation.sanitized_sql if validation.is_valid else plan.sql_query
+                )
+                trace_meta["ast_valid"] = validation.is_valid
             if not validation.is_valid:
                 error_msg = f"SQL Policy Violation: {'; '.join(validation.violations)}"
                 if validation.severity == "hard":
@@ -209,6 +217,8 @@ class ChatOrchestratorService:
                     )
                 guarded_rows, guard_redactions = self._apply_post_sql_guard(cached_result.rows)
                 masked_rows, row_redactions = self._masker.mask_rows(guarded_rows)
+                if trace_meta is not None:
+                    trace_meta["bq_bytes_billed"] = cached_result.bytes_processed
                 self._obs.increment_metric("bq_cache_hits")
                 return {
                     "query_result": cached_result.model_copy(update={"rows": masked_rows}),
@@ -221,6 +231,8 @@ class ChatOrchestratorService:
             try:
                 t_bq = time.perf_counter()
                 raw_result = await self._warehouse.execute_query(secured_sql)
+                if trace_meta is not None:
+                    trace_meta["bq_bytes_billed"] = raw_result.bytes_processed
                 if trace_id:
                     self._obs.record_span(
                         trace_id,
@@ -429,89 +441,177 @@ class ChatOrchestratorService:
             request.session_id, ChatMessage(role="user", content=safe_message)
         )
 
-        t_pre = time.perf_counter()
-        pre_guard = self._input_safety.inspect(request.message)
-        self._obs.record_span(
-            trace_id,
-            "pre_guard",
-            (time.perf_counter() - t_pre) * 1000,
-            {"is_safe": pre_guard.is_safe},
-        )
-        if not pre_guard.is_safe:
-            self._obs.increment_metric("deterministic_guardrail_blocks_total")
-            refusal = self._mask_text(
-                pre_guard.rejection_reason or "Request blocked by security policy."
-            )
-            await self._cache.append_chat_message(
-                request.session_id, ChatMessage(role="assistant", content=refusal)
-            )
-            return ChatResponse(
-                session_id=request.session_id,
-                trace_id=trace_id,
-                reply=refusal,
-                observability={"trace_id": trace_id, "blocked": True, "pre_guard": True},
-            )
-
         budget = TurnBudget(
             max_llm_calls=self._max_llm_calls_per_turn,
             max_cost_usd=self._max_turn_cost_usd,
         )
+        trace_meta: dict[str, Any] = {
+            "intent_classified": "unknown",
+            "generated_sql": None,
+            "ast_valid": None,
+            "bq_bytes_billed": 0,
+            "error_type": None,
+            "final_reply": "",
+        }
+
         try:
-            with turn_budget_scope(budget):
-                # 1. Safety Guardrail & Intent Classification
-                budget.check_can_call()
-                t0 = time.perf_counter()
-                decision = await self._llm.classify_and_guard(safe_message, history)
-                budget.record_call()
-                self._obs.record_span(
-                    trace_id,
-                    "guardrail_classification",
-                    (time.perf_counter() - t0) * 1000,
-                    {"intent": decision.intent.value, "is_safe": decision.is_safe},
+            t_pre = time.perf_counter()
+            pre_guard = self._input_safety.inspect(request.message)
+            self._obs.record_span(
+                trace_id,
+                "pre_guard",
+                (time.perf_counter() - t_pre) * 1000,
+                {"is_safe": pre_guard.is_safe},
+            )
+            if not pre_guard.is_safe:
+                self._obs.increment_metric("deterministic_guardrail_blocks_total")
+                trace_meta["intent_classified"] = "blocked_pre_guard"
+                trace_meta["error_type"] = "PreGuardBlocked"
+                refusal = self._mask_text(
+                    pre_guard.rejection_reason or "Request blocked by security policy."
+                )
+                trace_meta["final_reply"] = refusal
+                await self._cache.append_chat_message(
+                    request.session_id, ChatMessage(role="assistant", content=refusal)
+                )
+                return ChatResponse(
+                    session_id=request.session_id,
+                    trace_id=trace_id,
+                    reply=refusal,
+                    observability={"trace_id": trace_id, "blocked": True, "pre_guard": True},
                 )
 
-                if not decision.is_safe or decision.intent in {
-                    IntentType.BLOCKED_OFF_TOPIC,
-                    IntentType.BLOCKED_INJECTION,
-                }:
-                    self._obs.increment_metric("guardrail_blocks_total")
-                    refusal = self._mask_text(
-                        decision.rejection_reason
-                        or "I am an executive retail data analysis assistant and can only answer questions related to retail sales, customers, products, and saved reports."
-                    )
-                    await self._cache.append_chat_message(
-                        request.session_id, ChatMessage(role="assistant", content=refusal)
-                    )
-                    return ChatResponse(
-                        session_id=request.session_id,
-                        trace_id=trace_id,
-                        reply=refusal,
-                        observability={
-                            "trace_id": trace_id,
-                            "blocked": True,
-                            **budget.to_dict(),
-                        },
+            try:
+                with turn_budget_scope(budget):
+                    # 1. Safety Guardrail & Intent Classification
+                    budget.check_can_call()
+                    t0 = time.perf_counter()
+                    decision = await self._llm.classify_and_guard(safe_message, history)
+                    budget.record_call()
+                    trace_meta["intent_classified"] = decision.intent.value
+                    self._obs.record_span(
+                        trace_id,
+                        "guardrail_classification",
+                        (time.perf_counter() - t0) * 1000,
+                        {"intent": decision.intent.value, "is_safe": decision.is_safe},
                     )
 
-                # Preferences apply to this response only; persistence is design-only for the prototype.
-                prefs = UserPreferenceProfile(user_id=user.user_id)
-                if decision.detected_format_preference is not None:
-                    prefs.preferred_format = decision.detected_format_preference
-                if decision.detected_depth_preference is not None:
-                    prefs.preferred_depth = decision.detected_depth_preference
-
-                # 3. High-Stakes Destructive Operation Flow (Saved Reports Deletion)
-                if decision.intent == IntentType.DELETE_REPORTS:
-                    pending = await self._reports.prepare_deletion(
-                        user=user,
-                        session_id=request.session_id,
-                        scope=decision.delete_scope or "keyword",
-                        keyword=decision.delete_keyword,
-                    )
-                    if pending is None:
-                        reply = (
-                            "No matching saved reports owned by your account were found to delete."
+                    if not decision.is_safe or decision.intent in {
+                        IntentType.BLOCKED_OFF_TOPIC,
+                        IntentType.BLOCKED_INJECTION,
+                    }:
+                        self._obs.increment_metric("guardrail_blocks_total")
+                        trace_meta["error_type"] = decision.intent.value
+                        refusal = self._mask_text(
+                            decision.rejection_reason
+                            or "I am an executive retail data analysis assistant and can only answer questions related to retail sales, customers, products, and saved reports."
                         )
+                        trace_meta["final_reply"] = refusal
+                        await self._cache.append_chat_message(
+                            request.session_id, ChatMessage(role="assistant", content=refusal)
+                        )
+                        return ChatResponse(
+                            session_id=request.session_id,
+                            trace_id=trace_id,
+                            reply=refusal,
+                            observability={
+                                "trace_id": trace_id,
+                                "blocked": True,
+                                **budget.to_dict(),
+                            },
+                        )
+
+                    # Preferences apply to this response only; persistence is design-only for the prototype.
+                    prefs = UserPreferenceProfile(user_id=user.user_id)
+                    if decision.detected_format_preference is not None:
+                        prefs.preferred_format = decision.detected_format_preference
+                    if decision.detected_depth_preference is not None:
+                        prefs.preferred_depth = decision.detected_depth_preference
+
+                    # 3. High-Stakes Destructive Operation Flow (Saved Reports Deletion)
+                    if decision.intent == IntentType.DELETE_REPORTS:
+                        pending = await self._reports.prepare_deletion(
+                            user=user,
+                            session_id=request.session_id,
+                            scope=decision.delete_scope or "keyword",
+                            keyword=decision.delete_keyword,
+                        )
+                        if pending is None:
+                            reply = "No matching saved reports owned by your account were found to delete."
+                            trace_meta["final_reply"] = reply
+                            await self._cache.append_chat_message(
+                                request.session_id, ChatMessage(role="assistant", content=reply)
+                            )
+                            return ChatResponse(
+                                session_id=request.session_id,
+                                trace_id=trace_id,
+                                reply=reply,
+                                observability={"trace_id": trace_id, **budget.to_dict()},
+                            )
+
+                        safe_pending = pending.model_copy(
+                            update={
+                                "description": self._mask_text(pending.description),
+                                "target_report_titles": [
+                                    self._mask_text(title) for title in pending.target_report_titles
+                                ],
+                            }
+                        )
+                        bullet_lines: list[str] = []
+                        for idx, title in enumerate(safe_pending.target_report_titles):
+                            rid = (
+                                safe_pending.target_report_ids[idx][:8]
+                                if idx < len(safe_pending.target_report_ids)
+                                else "unknown"
+                            )
+                            created = (
+                                safe_pending.target_report_created_at[idx]
+                                if idx < len(safe_pending.target_report_created_at)
+                                else ""
+                            )
+                            created_suffix = f" ({created})" if created else ""
+                            bullet_lines.append(f"- `{rid}` — **{title}**{created_suffix}")
+                        titles_bullets = "\n".join(bullet_lines)
+                        hash_preview = (
+                            safe_pending.payload_hash[:12] if safe_pending.payload_hash else "n/a"
+                        )
+                        reply = (
+                            f"**Confirmation Required (Destructive Action)**\n"
+                            f"{safe_pending.description}\n\n"
+                            f"Matched reports:\n{titles_bullets}\n\n"
+                            f"Snapshot hash: `{hash_preview}`\n"
+                            f"Please confirm using token `{safe_pending.token}` (or approve in the prompt) before I permanently delete them."
+                        )
+                        trace_meta["final_reply"] = reply
+                        await self._cache.append_chat_message(
+                            request.session_id, ChatMessage(role="assistant", content=reply)
+                        )
+                        return ChatResponse(
+                            session_id=request.session_id,
+                            trace_id=trace_id,
+                            reply=reply,
+                            pending_confirmation=safe_pending,
+                            observability={
+                                "trace_id": trace_id,
+                                "awaiting_confirmation": True,
+                                **budget.to_dict(),
+                            },
+                        )
+
+                    # 4. List Saved Reports Shortcut
+                    if decision.intent == IntentType.LIST_REPORTS:
+                        reports = await self._reports.list_user_reports(user)
+                        if not reports:
+                            reply = "You currently have no saved reports."
+                        else:
+                            lines = [
+                                f"- **{r.title}** (`{r.report_id[:8]}...`, {r.created_at.strftime('%Y-%m-%d %H:%M UTC')})"
+                                for r in reports
+                            ]
+                            reply = self._mask_text(
+                                "Here are your saved reports:\n" + "\n".join(lines)
+                            )
+                        trace_meta["final_reply"] = reply
                         await self._cache.append_chat_message(
                             request.session_id, ChatMessage(role="assistant", content=reply)
                         )
@@ -522,236 +622,201 @@ class ChatOrchestratorService:
                             observability={"trace_id": trace_id, **budget.to_dict()},
                         )
 
-                    safe_pending = pending.model_copy(
-                        update={
-                            "description": self._mask_text(pending.description),
-                            "target_report_titles": [
-                                self._mask_text(title) for title in pending.target_report_titles
-                            ],
+                    # Golden knowledge retrieval and dynamic persona storage are design-only in this prototype.
+                    t_ret = time.perf_counter()
+                    schema_summary = await self._warehouse.get_all_schemas_summary()
+                    self._obs.record_span(
+                        trace_id,
+                        "schema_retrieval",
+                        (time.perf_counter() - t_ret) * 1000,
+                    )
+
+                    # 6. LangGraph Workflow (SQL Generation + Safety Validation + Differentiated Retry + Executive Synthesis)
+                    workflow_state = await self._analysis_graph.ainvoke(
+                        {
+                            "user_message": safe_message,
+                            "user_context": user,
+                            "history": history,
+                            "schema_summary": schema_summary,
+                            "preferences": prefs,
+                            "trace_id": trace_id,
+                            "attempt": 1,
+                            "soft_retries": 0,
+                            "syntax_retries": 0,
+                            "empty_retries": 0,
+                            "budget": budget,
+                            "trace_meta": trace_meta,
                         }
                     )
-                    bullet_lines: list[str] = []
-                    for idx, title in enumerate(safe_pending.target_report_titles):
-                        rid = (
-                            safe_pending.target_report_ids[idx][:8]
-                            if idx < len(safe_pending.target_report_ids)
-                            else "unknown"
-                        )
-                        created = (
-                            safe_pending.target_report_created_at[idx]
-                            if idx < len(safe_pending.target_report_created_at)
-                            else ""
-                        )
-                        created_suffix = f" ({created})" if created else ""
-                        bullet_lines.append(f"- `{rid}` — **{title}**{created_suffix}")
-                    titles_bullets = "\n".join(bullet_lines)
-                    hash_preview = (
-                        safe_pending.payload_hash[:12] if safe_pending.payload_hash else "n/a"
-                    )
-                    reply = (
-                        f"**Confirmation Required (Destructive Action)**\n"
-                        f"{safe_pending.description}\n\n"
-                        f"Matched reports:\n{titles_bullets}\n\n"
-                        f"Snapshot hash: `{hash_preview}`\n"
-                        f"Please confirm using token `{safe_pending.token}` (or approve in the prompt) before I permanently delete them."
-                    )
-                    await self._cache.append_chat_message(
-                        request.session_id, ChatMessage(role="assistant", content=reply)
-                    )
-                    return ChatResponse(
-                        session_id=request.session_id,
-                        trace_id=trace_id,
-                        reply=reply,
-                        pending_confirmation=safe_pending,
-                        observability={
-                            "trace_id": trace_id,
-                            "awaiting_confirmation": True,
-                            **budget.to_dict(),
-                        },
-                    )
 
-                # 4. List Saved Reports Shortcut
-                if decision.intent == IntentType.LIST_REPORTS:
-                    reports = await self._reports.list_user_reports(user)
-                    if not reports:
-                        reply = "You currently have no saved reports."
-                    else:
-                        lines = [
-                            f"- **{r.title}** (`{r.report_id[:8]}...`, {r.created_at.strftime('%Y-%m-%d %H:%M UTC')})"
-                            for r in reports
-                        ]
-                        reply = self._mask_text("Here are your saved reports:\n" + "\n".join(lines))
-                    await self._cache.append_chat_message(
-                        request.session_id, ChatMessage(role="assistant", content=reply)
-                    )
-                    return ChatResponse(
-                        session_id=request.session_id,
-                        trace_id=trace_id,
-                        reply=reply,
-                        observability={"trace_id": trace_id, **budget.to_dict()},
-                    )
-
-                # Golden knowledge retrieval and dynamic persona storage are design-only in this prototype.
-                t_ret = time.perf_counter()
-                schema_summary = await self._warehouse.get_all_schemas_summary()
-                self._obs.record_span(
-                    trace_id,
-                    "schema_retrieval",
-                    (time.perf_counter() - t_ret) * 1000,
+                    fatal = workflow_state.get("fatal_error")
+                    if isinstance(fatal, QueryBudgetExceededError):
+                        trace_meta["error_type"] = type(fatal).__name__
+                        budget_reply = self._mask_text(
+                            f"{fatal.message} Please narrow the date range or add specific category/brand filters."
+                        )
+                        trace_meta["final_reply"] = budget_reply
+                        await self._cache.append_chat_message(
+                            request.session_id, ChatMessage(role="assistant", content=budget_reply)
+                        )
+                        return ChatResponse(
+                            session_id=request.session_id,
+                            trace_id=trace_id,
+                            reply=budget_reply,
+                            sql_used=(
+                                self._mask_text(workflow_state["last_sql"])
+                                if workflow_state.get("last_sql")
+                                else None
+                            ),
+                            observability={
+                                "trace_id": trace_id,
+                                "bq_budget_exceeded": True,
+                                **budget.to_dict(),
+                            },
+                        )
+                    if fatal is not None:
+                        raise fatal
+            except TurnBudgetExceededError as exc:
+                trace_meta["error_type"] = type(exc).__name__
+                self._obs.increment_metric("turn_budget_exceeded_total")
+                budget_reply = self._mask_text(
+                    f"Turn budget reached ({exc.message}). Please narrow your question and retry."
                 )
-
-                # 6. LangGraph Workflow (SQL Generation + Safety Validation + Differentiated Retry + Executive Synthesis)
-                workflow_state = await self._analysis_graph.ainvoke(
-                    {
-                        "user_message": safe_message,
-                        "user_context": user,
-                        "history": history,
-                        "schema_summary": schema_summary,
-                        "preferences": prefs,
+                trace_meta["final_reply"] = budget_reply
+                await self._cache.append_chat_message(
+                    request.session_id, ChatMessage(role="assistant", content=budget_reply)
+                )
+                return ChatResponse(
+                    session_id=request.session_id,
+                    trace_id=trace_id,
+                    reply=budget_reply,
+                    observability={
                         "trace_id": trace_id,
-                        "attempt": 1,
-                        "soft_retries": 0,
-                        "syntax_retries": 0,
-                        "empty_retries": 0,
-                        "budget": budget,
-                    }
+                        "budget_exceeded": True,
+                        **budget.to_dict(),
+                    },
                 )
 
-                fatal = workflow_state.get("fatal_error")
-                if isinstance(fatal, QueryBudgetExceededError):
-                    budget_reply = self._mask_text(
-                        f"{fatal.message} Please narrow the date range or add specific category/brand filters."
-                    )
-                    await self._cache.append_chat_message(
-                        request.session_id, ChatMessage(role="assistant", content=budget_reply)
-                    )
-                    return ChatResponse(
+            query_result = workflow_state.get("query_result")
+            synthesis = workflow_state.get("synthesis")
+            if synthesis is None:
+                raise QueryExecutionError("Analysis workflow completed without synthesis output.")
+
+            pii_redactions_total = workflow_state.get("redactions_count", 0)
+
+            plan = workflow_state.get("sql_plan")
+            has_clarification = bool(plan and plan.response_message)
+            used_metrics_list = [] if has_clarification else list(synthesis.used_metric_definitions)
+            if (
+                not has_clarification
+                and not used_metrics_list
+                and query_result
+                and query_result.applied_metric_definitions
+            ):
+                used_metrics_list = list(query_result.applied_metric_definitions)
+            if not has_clarification and not used_metrics_list:
+                detected = self._glossary.detect_metrics(
+                    safe_message + " " + (query_result.sql_executed if query_result else "")
+                )
+                used_metrics_list = [
+                    f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in detected
+                ]
+            combined_md = f"{synthesis.executive_summary}\n\n{synthesis.detailed_analysis}"
+            if used_metrics_list and "Metric Definitions Applied" not in combined_md:
+                detected_metrics = self._glossary.detect_metrics(
+                    safe_message + " " + (query_result.sql_executed if query_result else "")
+                )
+                defs_block = self._glossary.format_response_definitions(detected_metrics or None)
+                if defs_block:
+                    combined_md += f"\n\n{defs_block}"
+
+            if synthesis.action_items:
+                actions_md = "\n".join(f"- {item}" for item in synthesis.action_items)
+                combined_md += f"\n\n### Action Items\n{actions_md}"
+
+            masked_reply, text_redactions = self._masker.mask_text(combined_md)
+            pii_redactions_total += text_redactions
+            if pii_redactions_total > 0:
+                self._obs.increment_metric("pii_redactions_total", pii_redactions_total)
+
+            masked_actions = [self._masker.mask_text(a)[0] for a in synthesis.action_items]
+            safe_executed_sql = self._mask_text(query_result.sql_executed) if query_result else None
+            if safe_executed_sql is not None:
+                trace_meta["generated_sql"] = safe_executed_sql
+            trace_meta["final_reply"] = masked_reply
+
+            # 8. Optional Report Persistence
+            saved_report_id: str | None = None
+            if request.save_report or decision.should_save_report:
+                report_title = self._mask_text(
+                    synthesis.report_title or f"Retail Analysis: {safe_message[:60]}"
+                )
+                saved = await self._reports.save_report(
+                    SavedReport(
+                        owner_user_id=user.user_id,
                         session_id=request.session_id,
-                        trace_id=trace_id,
-                        reply=budget_reply,
-                        sql_used=(
-                            self._mask_text(workflow_state["last_sql"])
-                            if workflow_state.get("last_sql")
-                            else None
-                        ),
-                        observability={
-                            "trace_id": trace_id,
-                            "bq_budget_exceeded": True,
-                            **budget.to_dict(),
-                        },
+                        question=safe_message,
+                        title=report_title,
+                        summary=self._masker.mask_text(synthesis.executive_summary)[0],
+                        content_markdown=masked_reply,
+                        action_items=masked_actions,
+                        sql_used=safe_executed_sql,
+                        metric_definitions=used_metrics_list,
                     )
-                if fatal is not None:
-                    raise fatal
-        except TurnBudgetExceededError as exc:
-            self._obs.increment_metric("turn_budget_exceeded_total")
-            budget_reply = self._mask_text(
-                f"Turn budget reached ({exc.message}). Please narrow your question and retry."
-            )
+                )
+                saved_report_id = saved.report_id
+
             await self._cache.append_chat_message(
-                request.session_id, ChatMessage(role="assistant", content=budget_reply)
+                request.session_id, ChatMessage(role="assistant", content=masked_reply)
             )
+
+            total_ms = round((time.perf_counter() - t_start) * 1000, 2)
             return ChatResponse(
                 session_id=request.session_id,
                 trace_id=trace_id,
-                reply=budget_reply,
+                reply=masked_reply,
+                action_items=masked_actions,
+                sql_used=safe_executed_sql,
+                data_preview=(query_result.rows[:10] if query_result else []),
+                row_count=query_result.row_count if query_result else 0,
+                saved_report_id=saved_report_id,
+                used_metric_definitions=used_metrics_list,
                 observability={
                     "trace_id": trace_id,
-                    "budget_exceeded": True,
+                    "total_latency_ms": total_ms,
+                    "sql_attempts": query_result.attempts if query_result else 0,
+                    "from_cache": query_result.from_cache if query_result else False,
+                    "bytes_processed": query_result.bytes_processed if query_result else 0,
+                    "pii_redactions": pii_redactions_total,
                     **budget.to_dict(),
                 },
             )
-
-        query_result = workflow_state.get("query_result")
-        synthesis = workflow_state.get("synthesis")
-        if synthesis is None:
-            raise QueryExecutionError("Analysis workflow completed without synthesis output.")
-
-        pii_redactions_total = workflow_state.get("redactions_count", 0)
-
-        plan = workflow_state.get("sql_plan")
-        has_clarification = bool(plan and plan.response_message)
-        used_metrics_list = [] if has_clarification else list(synthesis.used_metric_definitions)
-        if (
-            not has_clarification
-            and not used_metrics_list
-            and query_result
-            and query_result.applied_metric_definitions
-        ):
-            used_metrics_list = list(query_result.applied_metric_definitions)
-        if not has_clarification and not used_metrics_list:
-            detected = self._glossary.detect_metrics(
-                safe_message + " " + (query_result.sql_executed if query_result else "")
-            )
-            used_metrics_list = [
-                f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in detected
-            ]
-        combined_md = f"{synthesis.executive_summary}\n\n{synthesis.detailed_analysis}"
-        if used_metrics_list and "Metric Definitions Applied" not in combined_md:
-            detected_metrics = self._glossary.detect_metrics(
-                safe_message + " " + (query_result.sql_executed if query_result else "")
-            )
-            defs_block = self._glossary.format_response_definitions(detected_metrics or None)
-            if defs_block:
-                combined_md += f"\n\n{defs_block}"
-
-        if synthesis.action_items:
-            actions_md = "\n".join(f"- {item}" for item in synthesis.action_items)
-            combined_md += f"\n\n### Action Items\n{actions_md}"
-
-        masked_reply, text_redactions = self._masker.mask_text(combined_md)
-        pii_redactions_total += text_redactions
-        if pii_redactions_total > 0:
-            self._obs.increment_metric("pii_redactions_total", pii_redactions_total)
-
-        masked_actions = [self._masker.mask_text(a)[0] for a in synthesis.action_items]
-
-        # 8. Optional Report Persistence
-        saved_report_id: str | None = None
-        if request.save_report or decision.should_save_report:
-            report_title = self._mask_text(
-                synthesis.report_title or f"Retail Analysis: {safe_message[:60]}"
-            )
-            safe_sql = self._mask_text(query_result.sql_executed) if query_result else None
-            saved = await self._reports.save_report(
-                SavedReport(
-                    owner_user_id=user.user_id,
+        except Exception as exc:
+            trace_meta["error_type"] = type(exc).__name__
+            raise
+        finally:
+            total_ms = round((time.perf_counter() - t_start) * 1000, 2)
+            raw_sql = trace_meta.get("generated_sql")
+            self._obs.finish_trace(
+                TraceRecord(
+                    trace_id=trace_id,
+                    user_id=user.user_id,
                     session_id=request.session_id,
-                    question=safe_message,
-                    title=report_title,
-                    summary=self._masker.mask_text(synthesis.executive_summary)[0],
-                    content_markdown=masked_reply,
-                    action_items=masked_actions,
-                    sql_used=safe_sql,
-                    metric_definitions=used_metrics_list,
+                    intent_classified=str(trace_meta.get("intent_classified", "unknown")),
+                    generated_sql=(self._mask_text(str(raw_sql)) if raw_sql is not None else None),
+                    ast_valid=trace_meta.get("ast_valid"),
+                    bq_bytes_billed=int(trace_meta.get("bq_bytes_billed") or 0),
+                    llm_calls_count=budget.llm_calls,
+                    input_tokens=budget.input_tokens,
+                    output_tokens=budget.output_tokens,
+                    total_cost_usd=round(budget.total_cost_usd, 6),
+                    latency_ms=total_ms,
+                    error_type=trace_meta.get("error_type"),
+                    pii_redacted_prompt=safe_message,
+                    pii_redacted_response=str(trace_meta.get("final_reply") or ""),
+                    fallback_used=budget.fallback_used,
                 )
             )
-            saved_report_id = saved.report_id
-
-        await self._cache.append_chat_message(
-            request.session_id, ChatMessage(role="assistant", content=masked_reply)
-        )
-
-        total_ms = round((time.perf_counter() - t_start) * 1000, 2)
-        return ChatResponse(
-            session_id=request.session_id,
-            trace_id=trace_id,
-            reply=masked_reply,
-            action_items=masked_actions,
-            sql_used=self._mask_text(query_result.sql_executed) if query_result else None,
-            data_preview=(query_result.rows[:10] if query_result else []),
-            row_count=query_result.row_count if query_result else 0,
-            saved_report_id=saved_report_id,
-            used_metric_definitions=used_metrics_list,
-            observability={
-                "trace_id": trace_id,
-                "total_latency_ms": total_ms,
-                "sql_attempts": query_result.attempts if query_result else 0,
-                "from_cache": query_result.from_cache if query_result else False,
-                "bytes_processed": query_result.bytes_processed if query_result else 0,
-                "pii_redactions": pii_redactions_total,
-                **budget.to_dict(),
-            },
-        )
 
     def _apply_post_sql_guard(self, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
         """Enforce demographic k-anonymity and non-linkage before caching or masking."""

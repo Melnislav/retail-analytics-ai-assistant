@@ -16,6 +16,7 @@ from app.domain.models import (
     QueryExecutionResult,
     SavedReport,
     SQLPlan,
+    TraceRecord,
     UserContext,
     UserPreferenceProfile,
 )
@@ -143,5 +144,13 @@ class ObservabilityPort(Protocol):
     ) -> None: ...
 
     def increment_metric(self, metric_name: str, value: int = 1) -> None: ...
+
+    def finish_trace(self, record: TraceRecord) -> None: ...
+
+    def get_recent_traces(
+        self, limit: int = 10, user_id: str | None = None
+    ) -> list[TraceRecord]: ...
+
+    def get_trace(self, trace_id: str, user_id: str | None = None) -> TraceRecord | None: ...
 
     def get_metrics_snapshot(self) -> dict[str, Any]: ...

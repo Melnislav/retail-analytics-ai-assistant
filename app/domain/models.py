@@ -260,3 +260,26 @@ class ChatResponse(BaseModel):
         default_factory=list,
         description="Explicit retail metric definitions applied during this analysis turn.",
     )
+
+
+class TraceRecord(BaseModel):
+    """Privacy-safe local execution trace for correlation, debugging, and cost tracking."""
+
+    trace_id: str
+    user_id: str
+    session_id: str
+    persona_version: str = "default"
+    intent_classified: str = "unknown"
+    generated_sql: str | None = None
+    ast_valid: bool | None = None
+    bq_bytes_billed: int = 0
+    llm_calls_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_cost_usd: float = 0.0
+    latency_ms: float = 0.0
+    error_type: str | None = None
+    pii_redacted_prompt: str = ""
+    pii_redacted_response: str = ""
+    fallback_used: bool = False
+    created_at: datetime = Field(default_factory=utc_now)

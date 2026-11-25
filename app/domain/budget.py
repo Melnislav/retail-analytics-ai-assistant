@@ -47,6 +47,7 @@ class TurnBudget:
     input_tokens: int = 0
     output_tokens: int = 0
     total_cost_usd: float = 0.0
+    fallback_used: bool = False
 
     def check_can_call(self) -> None:
         """Fail fast before invoking an LLM if call or cost ceilings are reached."""
@@ -66,6 +67,10 @@ class TurnBudget:
             raise TurnBudgetExceededError(
                 f"Per-turn LLM call limit exceeded ({self.llm_calls}/{self.max_llm_calls})."
             )
+
+    def record_fallback(self) -> None:
+        """Mark that the current turn fell back to deterministic heuristic rules."""
+        self.fallback_used = True
 
     def record_usage(
         self,
@@ -93,6 +98,7 @@ class TurnBudget:
             "estimated_cost_usd": round(self.total_cost_usd, 6),
             "max_llm_calls": self.max_llm_calls,
             "max_cost_usd": self.max_cost_usd,
+            "fallback_used": self.fallback_used,
         }
 
 

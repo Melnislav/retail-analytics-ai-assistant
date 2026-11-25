@@ -147,6 +147,9 @@ class Settings(BaseSettings):
     )
 
     # Observability
+    trace_log_path: str = Field(
+        default="logs/agent_traces.jsonl", validation_alias="TRACE_LOG_PATH"
+    )
     langfuse_public_key: str = Field(default="", validation_alias="LANGFUSE_PUBLIC_KEY")
     langfuse_secret_key: str = Field(default="", validation_alias="LANGFUSE_SECRET_KEY")
     langfuse_host: str = Field(

@@ -20,7 +20,9 @@ from app.domain.models import (
     ChatResponse,
     ConfirmationRequest,
     SavedReport,
+    TraceRecord,
     UserContext,
+    UserRole,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["Retail Data Analysis Assistant"])
@@ -102,3 +104,29 @@ async def get_metrics(
     obs: ObservabilityPort = Depends(get_observability),
 ) -> dict:
     return obs.get_metrics_snapshot()
+
+
+@router.get("/traces", response_model=list[TraceRecord])
+async def list_traces(
+    limit: int = 10,
+    user: UserContext = Depends(get_current_user),
+    obs: ObservabilityPort = Depends(get_observability),
+) -> list[TraceRecord]:
+    scoped_user = None if user.role in {UserRole.CEO, UserRole.ADMIN} else user.user_id
+    return obs.get_recent_traces(limit=limit, user_id=scoped_user)
+
+
+@router.get("/traces/{trace_id}", response_model=TraceRecord)
+async def get_trace_detail(
+    trace_id: str,
+    user: UserContext = Depends(get_current_user),
+    obs: ObservabilityPort = Depends(get_observability),
+) -> TraceRecord:
+    scoped_user = None if user.role in {UserRole.CEO, UserRole.ADMIN} else user.user_id
+    record = obs.get_trace(trace_id, user_id=scoped_user)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Trace not found.",
+        )
+    return record

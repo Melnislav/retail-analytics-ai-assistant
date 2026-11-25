@@ -33,10 +33,17 @@ class ApplicationContainer:
             confirmation_ttl_seconds=settings.confirmation_ttl_seconds,
             chat_history_ttl_seconds=settings.chat_history_ttl_seconds,
         )
+        self.privacy_policy = PrivacyPolicy(
+            demographic_min_group_size=settings.demographic_min_group_size
+        )
+        self.pii_masker = PIIMasker(salt=settings.pii_salt, policy=self.privacy_policy)
+        self.post_sql_guard = PostSQLDataGuard(policy=self.privacy_policy)
         self.observability = StructuredObservabilityAdapter(
             langfuse_public_key=settings.langfuse_public_key,
             langfuse_secret_key=settings.langfuse_secret_key,
             langfuse_host=settings.langfuse_host,
+            trace_log_path=settings.trace_log_path,
+            pii_masker=self.pii_masker,
         )
 
         # Only saved reports require prototype persistence.
@@ -48,11 +55,6 @@ class ApplicationContainer:
             enabled=settings.enable_semantic_glossary,
             clarification_messages=settings.metric_clarification_messages,
         )
-        self.privacy_policy = PrivacyPolicy(
-            demographic_min_group_size=settings.demographic_min_group_size
-        )
-        self.pii_masker = PIIMasker(salt=settings.pii_salt, policy=self.privacy_policy)
-        self.post_sql_guard = PostSQLDataGuard(policy=self.privacy_policy)
         self.sql_policy = SQLPolicyEngine(
             dataset_id=settings.bq_dataset_id,
             default_limit=settings.default_row_limit,

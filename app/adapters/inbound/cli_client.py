@@ -82,7 +82,8 @@ class RetailAssistantCLI:
                 f"User: [green]{self.user_name}[/green] (`{self.user_id}`, role=`{self.user_role}`)\n"
                 f"Session: [yellow]{self.session_id}[/yellow] | Mode: [magenta]{mode_str}[/magenta]\n"
                 "Commands: [bold]/help[/bold], [bold]/users[/bold], [bold]/user <id>[/bold], [bold]/clear[/bold], "
-                "[bold]/reports[/bold], [bold]/report <id>[/bold], [bold]/save <question>[/bold], [bold]/exit[/bold]",
+                "[bold]/reports[/bold], [bold]/report <id>[/bold], [bold]/save <question>[/bold], "
+                "[bold]/metrics[/bold], [bold]/trace [id][/bold], [bold]/exit[/bold]",
                 border_style="cyan",
             )
         )
@@ -110,6 +111,8 @@ class RetailAssistantCLI:
                 "• [bold]/reports[/bold] - List your saved reports\n"
                 "• [bold]/report <id>[/bold] - View a full saved report (question, SQL, and answer)\n"
                 "• [bold]/save <query>[/bold] - Ask question and save executive report\n"
+                "• [bold]/metrics[/bold] - Show local agent counters and latency percentiles\n"
+                "• [bold]/trace [id][/bold] - Inspect recent execution traces or a specific trace ID\n"
                 "• [bold]/exit[/bold] - Exit CLI",
                 title="[bold green]Retail Assistant Help & Sample Queries[/bold green]",
                 border_style="green",
@@ -356,6 +359,127 @@ class RetailAssistantCLI:
             )
         )
 
+    async def _show_metrics(self, client: httpx.AsyncClient | None) -> None:
+        snapshot: dict[str, Any] | None = None
+        if self.standalone and self.container:
+            snapshot = self.container.observability.get_metrics_snapshot()
+        elif client:
+            try:
+                resp = await client.get(f"{self.base_url}/api/v1/metrics", headers=self.headers)
+                if resp.status_code == 200:
+                    snapshot = resp.json()
+                else:
+                    console.print(f"[red]Error {resp.status_code}: {resp.text}[/red]")
+                    return
+            except Exception as exc:
+                console.print(f"[bold red]Error fetching metrics:[/bold red] {exc}")
+                return
+
+        if not snapshot:
+            console.print("[dim]No metrics available.[/dim]")
+            return
+
+        tbl = Table(title="Agent Observability Metrics")
+        tbl.add_column("Metric", style="cyan")
+        tbl.add_column("Value", style="bold")
+        for key, val in sorted((snapshot.get("counters") or {}).items()):
+            tbl.add_row(str(key), str(val))
+        lat = snapshot.get("latency_ms") or {}
+        if lat:
+            tbl.add_row(
+                "latency_ms (p50 / p95 / p99)",
+                f"{lat.get('p50', 0)} / {lat.get('p95', 0)} / {lat.get('p99', 0)} (n={lat.get('count', 0)})",
+            )
+        if snapshot.get("trace_log_path"):
+            tbl.add_row("trace_log_path", str(snapshot["trace_log_path"]))
+        console.print(tbl)
+
+    async def _show_trace(
+        self, client: httpx.AsyncClient | None, trace_id: str | None = None
+    ) -> None:
+        scoped_user = None if self.user_role in {"ceo", "admin"} else self.user_id
+        if trace_id:
+            record_data: dict[str, Any] | None = None
+            if self.standalone and self.container:
+                rec = self.container.observability.get_trace(trace_id, user_id=scoped_user)
+                record_data = rec.model_dump(mode="json") if rec else None
+            elif client:
+                try:
+                    resp = await client.get(
+                        f"{self.base_url}/api/v1/traces/{trace_id}", headers=self.headers
+                    )
+                    if resp.status_code == 200:
+                        record_data = resp.json()
+                    elif resp.status_code != 404:
+                        console.print(f"[red]Error {resp.status_code}: {resp.text}[/red]")
+                        return
+                except Exception as exc:
+                    console.print(f"[bold red]Error fetching trace:[/bold red] {exc}")
+                    return
+
+            if not record_data:
+                console.print(f"[yellow]Trace '{trace_id}' not found.[/yellow]")
+                return
+
+            detail_md = (
+                f"**Trace ID:** `{record_data['trace_id']}` | **User:** `{record_data['user_id']}` | "
+                f"**Session:** `{record_data['session_id']}`  \n"
+                f"**Intent:** `{record_data.get('intent_classified')}` | **AST Valid:** `{record_data.get('ast_valid')}` | "
+                f"**Fallback Used:** `{record_data.get('fallback_used')}`  \n"
+                f"**Latency:** {record_data.get('latency_ms', 0)} ms | "
+                f"**LLM Calls:** {record_data.get('llm_calls_count', 0)} | "
+                f"**Cost:** ${record_data.get('total_cost_usd', 0):.6f} | "
+                f"**BQ Bytes:** {record_data.get('bq_bytes_billed', 0)}  \n"
+                f"**Error Type:** `{record_data.get('error_type')}`  \n"
+                f"**Prompt (redacted):** {record_data.get('pii_redacted_prompt', '')}\n\n"
+                f"**SQL:**\n```sql\n{record_data.get('generated_sql') or '(none)'}\n```"
+            )
+            console.print(
+                Panel(Markdown(detail_md), title="Execution Trace Detail", border_style="magenta")
+            )
+            return
+
+        traces_list: list[dict[str, Any]] = []
+        if self.standalone and self.container:
+            recs = self.container.observability.get_recent_traces(limit=10, user_id=scoped_user)
+            traces_list = [r.model_dump(mode="json") for r in recs]
+        elif client:
+            try:
+                resp = await client.get(f"{self.base_url}/api/v1/traces", headers=self.headers)
+                if resp.status_code == 200:
+                    traces_list = resp.json()
+                else:
+                    console.print(f"[red]Error {resp.status_code}: {resp.text}[/red]")
+                    return
+            except Exception as exc:
+                console.print(f"[bold red]Error fetching traces:[/bold red] {exc}")
+                return
+
+        if not traces_list:
+            console.print("[dim]No execution traces recorded yet.[/dim]")
+            return
+
+        tbl = Table(title="Recent Execution Traces")
+        tbl.add_column("Trace ID", style="cyan")
+        tbl.add_column("Intent")
+        tbl.add_column("LLM")
+        tbl.add_column("Cost ($)")
+        tbl.add_column("Latency (ms)")
+        tbl.add_column("Error")
+        for tr in traces_list:
+            tbl.add_row(
+                str(tr.get("trace_id", "")),
+                str(tr.get("intent_classified", "")),
+                str(tr.get("llm_calls_count", 0)),
+                f"{float(tr.get('total_cost_usd', 0)):.5f}",
+                str(tr.get("latency_ms", 0)),
+                str(tr.get("error_type") or "-"),
+            )
+        console.print(tbl)
+        console.print(
+            "[dim]Tip: run /trace <trace_id> to inspect prompt, SQL, and failure reason.[/dim]"
+        )
+
     async def run(self) -> None:
         if self.standalone:
             from app.infrastructure.container import ApplicationContainer
@@ -444,6 +568,19 @@ class RetailAssistantCLI:
                 if text.lower().startswith("/report "):
                     target_id = text.split(maxsplit=1)[1].strip()
                     await self._view_report(client_ctx, target_id)
+                    continue
+
+                if text.lower() == "/metrics":
+                    await self._show_metrics(client_ctx)
+                    continue
+
+                if text.lower() == "/trace":
+                    await self._show_trace(client_ctx)
+                    continue
+
+                if text.lower().startswith("/trace "):
+                    target_trace_id = text.split(maxsplit=1)[1].strip()
+                    await self._show_trace(client_ctx, target_trace_id)
                     continue
 
                 if text.lower().startswith("/role "):
