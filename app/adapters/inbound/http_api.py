@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.application.chat_orchestrator import ChatOrchestratorService
 from app.application.ports import ObservabilityPort
@@ -20,6 +20,7 @@ from app.domain.models import (
     ChatResponse,
     ConfirmationRequest,
     SavedReport,
+    TraceRecord,
     UserContext,
     UserRole,
 )
@@ -27,28 +28,9 @@ from app.domain.models import (
 router = APIRouter(prefix="/api/v1", tags=["Retail Data Analysis Assistant"])
 
 
-def get_current_user(
-    x_user_id: str = Header(default="manager_alice", alias="X-User-Id"),
-    x_user_name: str = Header(default="Alice (Brand Manager)", alias="X-User-Name"),
-    x_user_role: str = Header(default="brand_manager", alias="X-User-Role"),
-    x_allowed_brands: str = Header(default="", alias="X-Allowed-Brands"),
-) -> UserContext:
-    """Extracts user identity and brand permissions from trusted request headers."""
-    try:
-        role = UserRole(x_user_role.lower())
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Unknown user role; access denied.",
-        ) from exc
-
-    brands = [brand.strip() for brand in x_allowed_brands.split(",") if brand.strip()]
-    return UserContext(
-        user_id=x_user_id,
-        display_name=x_user_name,
-        role=role,
-        allowed_brands=brands,
-    )
+def get_current_user(request: Request) -> UserContext:
+    """Return the server-controlled prototype identity, never caller-supplied authority."""
+    return request.app.state.container.prototype_user
 
 
 def get_orchestrator(request: Request) -> ChatOrchestratorService:
@@ -102,8 +84,49 @@ async def list_reports(
     return await report_service.list_user_reports(user)
 
 
+@router.get("/reports/{report_id}", response_model=SavedReport)
+async def get_report(
+    report_id: str,
+    user: UserContext = Depends(get_current_user),
+    report_service: ReportService = Depends(get_report_service),
+) -> SavedReport:
+    report = await report_service.get_user_report(user, report_id)
+    if report is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report not found.",
+        )
+    return report
+
+
 @router.get("/metrics")
 async def get_metrics(
     obs: ObservabilityPort = Depends(get_observability),
 ) -> dict:
     return obs.get_metrics_snapshot()
+
+
+@router.get("/traces", response_model=list[TraceRecord])
+async def list_traces(
+    limit: int = 10,
+    user: UserContext = Depends(get_current_user),
+    obs: ObservabilityPort = Depends(get_observability),
+) -> list[TraceRecord]:
+    scoped_user = None if user.role in {UserRole.CEO, UserRole.ADMIN} else user.user_id
+    return obs.get_recent_traces(limit=limit, user_id=scoped_user)
+
+
+@router.get("/traces/{trace_id}", response_model=TraceRecord)
+async def get_trace_detail(
+    trace_id: str,
+    user: UserContext = Depends(get_current_user),
+    obs: ObservabilityPort = Depends(get_observability),
+) -> TraceRecord:
+    scoped_user = None if user.role in {UserRole.CEO, UserRole.ADMIN} else user.user_id
+    record = obs.get_trace(trace_id, user_id=scoped_user)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Trace not found.",
+        )
+    return record

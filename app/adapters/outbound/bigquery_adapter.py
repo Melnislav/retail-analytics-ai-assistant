@@ -10,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 
+from app.domain.exceptions import QueryBudgetExceededError
 from app.domain.models import QueryExecutionResult
 
 logger = logging.getLogger(__name__)
@@ -215,8 +216,22 @@ class BigQueryRunner:
         self.max_bytes_billed = max_bytes_billed
         self.query_timeout_seconds = query_timeout_seconds
 
+    def dry_run(self, sql_query: str) -> int:
+        from google.cloud import bigquery
+
+        dry_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+        dry_job = self.client.query(sql_query, job_config=dry_config)
+        return int(getattr(dry_job, "total_bytes_processed", 0) or 0)
+
     def execute_query(self, sql_query: str) -> tuple[pd.DataFrame, int]:
         from google.cloud import bigquery
+
+        estimated_bytes = self.dry_run(sql_query)
+        if estimated_bytes > self.max_bytes_billed:
+            raise QueryBudgetExceededError(
+                f"Query scan estimate ({estimated_bytes:,} bytes) exceeds the configured byte limit "
+                f"({self.max_bytes_billed:,} bytes). Please narrow the date range, category, or filters."
+            )
 
         job_config = bigquery.QueryJobConfig(
             maximum_bytes_billed=self.max_bytes_billed,

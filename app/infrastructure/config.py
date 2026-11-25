@@ -10,6 +10,8 @@ import yaml
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.domain.models import UserContext, UserRole
+
 
 def load_user_rbac_profiles(
     config_path: str | Path = "configs/users_rbac.yaml",
@@ -50,6 +52,42 @@ def load_user_rbac_profiles(
     }
 
 
+def resolve_local_user_context(
+    profile_key: str,
+    config_path: str | Path = "configs/users_rbac.yaml",
+) -> UserContext:
+    """Resolve a prototype identity exclusively from the local RBAC configuration."""
+    profile = load_user_rbac_profiles(config_path).get(profile_key)
+    if not isinstance(profile, dict):
+        raise ValueError(f"Unknown local RBAC profile: {profile_key}")
+
+    try:
+        return UserContext(
+            user_id=str(profile["user_id"]),
+            display_name=str(profile.get("display_name", "Executive User")),
+            role=UserRole(str(profile["role"]).lower()),
+            allowed_brands=[str(brand) for brand in profile.get("allowed_brands", [])],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid local RBAC profile: {profile_key}") from exc
+
+
+def load_business_glossary(
+    config_path: str | Path = "configs/business_glossary.yaml",
+) -> dict[str, Any]:
+    """Load default business metric definitions from YAML configuration."""
+    path = Path(config_path)
+    if path.is_file():
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+                if isinstance(data, dict) and isinstance(data.get("metrics"), dict):
+                    return dict(data["metrics"])
+        except Exception:
+            pass
+    return {}
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -67,7 +105,7 @@ class Settings(BaseSettings):
     # LLM Provider (Primary & Fallback: Gemini, OpenRouter, OpenAI)
     llm_provider: str = Field(default="gemini", validation_alias="LLM_PROVIDER")
     google_api_key: str = Field(default="", validation_alias="GOOGLE_API_KEY")
-    gemini_model: str = Field(default="gemini-3.8-flash", validation_alias="GEMINI_MODEL")
+    gemini_model: str = Field(default="gemini-2.5-flash", validation_alias="GEMINI_MODEL")
     openrouter_api_key: str = Field(default="", validation_alias="OPENROUTER_API_KEY")
     openrouter_model: str = Field(
         default="google/gemma-4-31b-it:free", validation_alias="OPENROUTER_MODEL"
@@ -99,6 +137,8 @@ class Settings(BaseSettings):
 
     # Resilience & Persona
     max_sql_retries: int = Field(default=3, validation_alias="MAX_SQL_RETRIES")
+    max_llm_calls_per_turn: int = Field(default=5, ge=1, validation_alias="MAX_LLM_CALLS_PER_TURN")
+    max_turn_cost_usd: float = Field(default=1.0, gt=0.0, validation_alias="MAX_TURN_COST_USD")
     default_row_limit: int = Field(default=200, validation_alias="DEFAULT_ROW_LIMIT")
     default_persona_tone: str = Field(
         default=(
@@ -111,6 +151,9 @@ class Settings(BaseSettings):
     chat_history_ttl_seconds: int = Field(
         default=86400, validation_alias="CHAT_HISTORY_TTL_SECONDS"
     )
+    prototype_user_profile: str = Field(
+        default="brand_manager_alice", validation_alias="PROTOTYPE_USER_PROFILE"
+    )
     # Data Protection & PII
     pii_salt: str = Field(default="retail-pii-salt-2026", validation_alias="PII_SALT")
     demographic_min_group_size: int = Field(
@@ -120,6 +163,9 @@ class Settings(BaseSettings):
     )
 
     # Observability
+    trace_log_path: str = Field(
+        default="logs/agent_traces.jsonl", validation_alias="TRACE_LOG_PATH"
+    )
     langfuse_public_key: str = Field(default="", validation_alias="LANGFUSE_PUBLIC_KEY")
     langfuse_secret_key: str = Field(default="", validation_alias="LANGFUSE_SECRET_KEY")
     langfuse_host: str = Field(

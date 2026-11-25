@@ -16,6 +16,7 @@ from app.domain.models import (
     QueryExecutionResult,
     SavedReport,
     SQLPlan,
+    TraceRecord,
     UserContext,
     UserPreferenceProfile,
 )
@@ -35,6 +36,8 @@ class ChatUseCasePort(Protocol):
 
 class ReportManagementPort(Protocol):
     async def list_user_reports(self, user: UserContext) -> list[SavedReport]: ...
+
+    async def get_user_report(self, user: UserContext, report_id: str) -> SavedReport | None: ...
 
     async def save_report(self, report: SavedReport) -> SavedReport: ...
 
@@ -98,11 +101,19 @@ class ReportRepositoryPort(Protocol):
 
     async def list_by_owner(self, owner_user_id: str) -> list[SavedReport]: ...
 
+    async def get_by_id(self, owner_user_id: str, report_id: str) -> SavedReport | None: ...
+
     async def find_by_session(self, owner_user_id: str, session_id: str) -> list[SavedReport]: ...
 
     async def find_by_keyword(self, owner_user_id: str, keyword: str) -> list[SavedReport]: ...
 
-    async def delete_by_ids(self, owner_user_id: str, report_ids: list[str]) -> int: ...
+    async def delete_by_ids(
+        self,
+        owner_user_id: str,
+        report_ids: list[str],
+        *,
+        require_exact_match: bool = False,
+    ) -> int: ...
 
 
 class ConfirmationStorePort(Protocol):
@@ -133,5 +144,13 @@ class ObservabilityPort(Protocol):
     ) -> None: ...
 
     def increment_metric(self, metric_name: str, value: int = 1) -> None: ...
+
+    def finish_trace(self, record: TraceRecord) -> None: ...
+
+    def get_recent_traces(
+        self, limit: int = 10, user_id: str | None = None
+    ) -> list[TraceRecord]: ...
+
+    def get_trace(self, trace_id: str, user_id: str | None = None) -> TraceRecord | None: ...
 
     def get_metrics_snapshot(self) -> dict[str, Any]: ...

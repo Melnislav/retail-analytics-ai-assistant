@@ -1,0 +1,60 @@
+metrics:
+  net_revenue:
+    key: "net_revenue"
+    name: "Net Revenue"
+    description: "Total recognized revenue excluding cancelled and returned items."
+    sql_formula: "SUM(sale_price) WHERE status NOT IN ('Cancelled', 'Returned')"
+    business_rule: >
+      Cancelled and returned orders are strictly excluded from net sales.
+      For completed orders, sale_price represents actual realized transaction revenue.
+    override_hint: "Override example: 'define revenue including returned items' or 'calculate gross revenue'"
+    keywords: ["revenue", "sales", "net sales", "net revenue", "spend", "top line", "underspending"]
+
+  gmv:
+    key: "gmv"
+    name: "Gross Merchandise Value (GMV)"
+    description: "Total value of merchandise ordered over a period before returns and refunds."
+    sql_formula: "SUM(sale_price) WHERE status != 'Cancelled'"
+    business_rule: >
+      Reflects gross demand placed by customers. Excludes orders cancelled before shipment,
+      but includes items that may be returned post-delivery.
+    override_hint: "Override example: 'define GMV including cancelled orders'"
+    keywords: ["gmv", "gross merchandise value", "gross sales", "gross volume"]
+
+  churn_rate:
+    key: "churn_rate"
+    name: "Customer Churn Rate"
+    description: "Customer churn: buyers with completed orders who placed no purchases in the last 90 days."
+    sql_formula: "SAFE_DIVIDE(COUNT(DISTINCT churned_user_id), COUNT(DISTINCT total_user_id)) * 100 (churned = no orders in past 90 days)"
+    business_rule: "Default customer churn threshold is 90 days of purchase inactivity following a completed order."
+    override_hint: "Override example: 'define churn as no purchase in 60 days' or 'calculate churn for 60 days'"
+    keywords: ["churn", "churned", "retention", "attrition", "lost customer", "отток"]
+
+  gross_margin:
+    key: "gross_margin"
+    name: "Gross Margin"
+    description: "Percentage of net sales retained after subtracting cost of goods sold (COGS)."
+    sql_formula: "ROUND(SAFE_DIVIDE(SUM(oi.sale_price - p.cost), SUM(oi.sale_price)) * 100, 2)"
+    business_rule: >
+      Requires joining order_items with products on order_items.product_id = products.id.
+      Excludes cancelled and returned items.
+    override_hint: "Override example: 'define gross margin in absolute USD dollars' or 'calculate margin without product cost'"
+    keywords: ["margin", "gross margin", "profit", "profitability", "cogs", "markup"]
+
+  repeat_customer_rate:
+    key: "repeat_customer_rate"
+    name: "Repeat Customer Rate"
+    description: "Percentage of active purchasers who have placed 2 or more completed orders within the same brand."
+    sql_formula: "ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN completed_orders >= 2 THEN user_id END), COUNT(DISTINCT user_id)) * 100, 2)"
+    business_rule: "Evaluates brand loyalty as the share of customers with 2 or more completed orders within that brand."
+    override_hint: "Override example: 'define repeat customer as placed 3 or more orders'"
+    keywords: ["repeat", "repeat customer", "repeat purchase", "loyalty", "re-order", "frequent buyer", "повторн"]
+
+  aov:
+    key: "aov"
+    name: "Average Order Value (AOV)"
+    description: "Average monetary value generated per completed order."
+    sql_formula: "ROUND(SAFE_DIVIDE(SUM(sale_price), COUNT(DISTINCT order_id)), 2) WHERE status = 'Complete'"
+    business_rule: "Calculated as total net sale price divided by count of distinct completed orders."
+    override_hint: "Override example: 'calculate AOV across all orders including returned items'"
+    keywords: ["aov", "average order value", "basket size", "avg order", "average spend per order"]

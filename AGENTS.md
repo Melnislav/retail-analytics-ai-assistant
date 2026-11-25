@@ -4,7 +4,7 @@
 
 This repository contains a Python 3.12 retail analytics assistant. It accepts natural-language analysis requests, applies deterministic privacy and SQL policy checks, executes read-only analytics, and manages user-owned saved reports. Keep domain policy independent of frameworks and adapters.
 
-Before making **any architectural change**, read the [High-Level Design](documentation/high_level_design_hld_retail_data_analysis_chat_assistant.md). The assessment file is the source of project goals and requirements; do not duplicate or reinterpret its scope in implementation documentation.
+Before making **any architectural change**, read the [High-Level Design](documentation/high_level_design_HLD.md). The assessment file is the source of project goals and requirements; do not duplicate or reinterpret its scope in implementation documentation.
 
 ## Directory Map
 

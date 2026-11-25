@@ -22,6 +22,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project --all-extras
 
 COPY app ./app
+COPY configs ./configs
 COPY main.py config.py container.py ./
 COPY tests ./tests
 COPY README.md ./

@@ -4,9 +4,49 @@ from __future__ import annotations
 
 import contextlib
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+
+class SessionGlossaryOverrides(BaseModel):
+    """Per-session metric parameter overrides applied without mutating global defaults."""
+
+    churn_days: int | None = None
+    repeat_min_orders: int | None = None
+    revenue_include_returns: bool | None = None
+    aov_include_returns: bool | None = None
+
+    def is_empty(self) -> bool:
+        return (
+            self.churn_days is None
+            and self.repeat_min_orders is None
+            and self.revenue_include_returns is None
+            and self.aov_include_returns is None
+        )
+
+    def merge(self, other: SessionGlossaryOverrides) -> SessionGlossaryOverrides:
+        return SessionGlossaryOverrides(
+            churn_days=other.churn_days if other.churn_days is not None else self.churn_days,
+            repeat_min_orders=(
+                other.repeat_min_orders
+                if other.repeat_min_orders is not None
+                else self.repeat_min_orders
+            ),
+            revenue_include_returns=(
+                other.revenue_include_returns
+                if other.revenue_include_returns is not None
+                else self.revenue_include_returns
+            ),
+            aov_include_returns=(
+                other.aov_include_returns
+                if other.aov_include_returns is not None
+                else self.aov_include_returns
+            ),
+        )
 
 
 class MetricDefinition(BaseModel):
@@ -157,6 +197,12 @@ DEFAULT_METRIC_CLARIFICATION_MESSAGES: dict[str, str] = {
 class SemanticGlossary:
     """Catalog of retail business metric definitions with prompt formatting and override support."""
 
+    _CHURN_DAY_PATTERNS: tuple[str, ...] = (
+        r"interval\s+(\d+)\s+day",
+        r"(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)[^\n.]{0,50}?\b(\d+)\s*(?:days?|дней|дня|дн)\b",
+        r"\b(\d+)\s*(?:days?|дней|дня|дн)\b[^\n.]{0,40}?(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)",
+    )
+
     def __init__(
         self,
         custom_definitions: dict[str, Any] | None = None,
@@ -238,16 +284,10 @@ class SemanticGlossary:
         )
         return "\n".join(lines)
 
-    @staticmethod
-    def _extract_churn_days(low: str) -> int | None:
+    @classmethod
+    def _extract_churn_days(cls, low: str) -> int | None:
         """Extract user-specified churn inactivity days (e.g., 60 days)."""
-        patterns = [
-            r"interval\s+(\d+)\s+day",
-            r"(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)[^\n.]{0,40}?(\d+)\s*(?:days?|дней|дня|дн)",
-            r"(\d+)\s*(?:days?|дней|дня|дн)[^\n.]{0,40}?(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)",
-            r"(?:churn|отток)[^\n.]{0,30}?(\d+)",
-        ]
-        for pat in patterns:
+        for pat in cls._CHURN_DAY_PATTERNS:
             match = re.search(pat, low)
             if match:
                 with contextlib.suppress(ValueError):
@@ -488,6 +528,163 @@ class SemanticGlossary:
                 matched.append(resolved_metric)
         return matched
 
+    @staticmethod
+    def _excludes_returns(text: str) -> bool:
+        low = text.lower()
+        return any(
+            phrase in low
+            for phrase in [
+                "excluding return",
+                "exclude returned",
+                "excludes returned",
+                "без возвратов",
+                "исключая возвраты",
+            ]
+        )
+
+    def extract_session_overrides(
+        self, user_message: str
+    ) -> tuple[SessionGlossaryOverrides, str | None]:
+        """Parse and range-validate explicit metric overrides requested in conversation."""
+        low = user_message.lower()
+        churn_days: int | None = None
+        if "churn" in low or "отток" in low:
+            for pat in self._CHURN_DAY_PATTERNS:
+                match = re.search(pat, low)
+                if match:
+                    val = int(match.group(1))
+                    if val < 1 or val > 365:
+                        return (
+                            SessionGlossaryOverrides(),
+                            "Invalid churn window: inactivity threshold must be between 1 and 365 days.",
+                        )
+                    churn_days = val
+                    break
+
+        repeat_min_orders: int | None = None
+        if "repeat" in low or "повторн" in low:
+            explicit_repeat = self._extract_repeat_threshold(low)
+            if explicit_repeat is not None:
+                repeat_min_orders = explicit_repeat
+
+        revenue_include_returns: bool | None = None
+        if any(term in low for term in ("revenue", "sales", "выруч", "продаж")):
+            if self._includes_returns(low):
+                revenue_include_returns = True
+            elif self._excludes_returns(low):
+                revenue_include_returns = False
+
+        aov_include_returns: bool | None = None
+        if any(term in low for term in ("aov", "average order", "basket size")):
+            if self._includes_returns(low):
+                aov_include_returns = True
+            elif self._excludes_returns(low):
+                aov_include_returns = False
+
+        return (
+            SessionGlossaryOverrides(
+                churn_days=churn_days,
+                repeat_min_orders=repeat_min_orders,
+                revenue_include_returns=revenue_include_returns,
+                aov_include_returns=aov_include_returns,
+            ),
+            None,
+        )
+
+    def with_session_overrides(
+        self, overrides: SessionGlossaryOverrides | None
+    ) -> SemanticGlossary:
+        """Return a non-mutating copy with session-level metric overrides applied."""
+        if overrides is None or overrides.is_empty() or not self._enabled:
+            return self
+
+        scoped = SemanticGlossary(
+            enabled=self._enabled,
+            clarification_messages=dict(self._clarification_messages),
+        )
+        scoped._metrics = dict(self._metrics)
+        scoped._custom_churn_definition = self._custom_churn_definition
+
+        if overrides.churn_days is not None and "churn_rate" in scoped._metrics:
+            days = overrides.churn_days
+            scoped._metrics["churn_rate"] = scoped._metrics["churn_rate"].model_copy(
+                update={
+                    "description": (
+                        "Customer churn: buyers with completed orders who placed no purchases "
+                        f"in the last {days} days (User custom rule: {days} days)."
+                    ),
+                    "sql_formula": (
+                        "SAFE_DIVIDE(COUNT(DISTINCT churned_user_id), "
+                        "COUNT(DISTINCT total_user_id)) * 100 "
+                        f"(churned = no orders in past {days} days)"
+                    ),
+                    "business_rule": (
+                        f"User-specified churn threshold: {days} days of purchase inactivity "
+                        "following a completed order."
+                    ),
+                }
+            )
+
+        if overrides.repeat_min_orders is not None and "repeat_customer_rate" in scoped._metrics:
+            min_orders = overrides.repeat_min_orders
+            scoped._metrics["repeat_customer_rate"] = scoped._metrics[
+                "repeat_customer_rate"
+            ].model_copy(
+                update={
+                    "description": (
+                        f"Percentage of active purchasers who have placed {min_orders} or more "
+                        f"completed orders (User custom rule: {min_orders}+ orders)."
+                    ),
+                    "sql_formula": (
+                        "ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN completed_orders >= "
+                        f"{min_orders} THEN user_id END), COUNT(DISTINCT user_id)) * 100, 2)"
+                    ),
+                    "business_rule": (
+                        f"User-specified repeat threshold: {min_orders} or more completed orders."
+                    ),
+                }
+            )
+
+        if overrides.revenue_include_returns is not None and "net_revenue" in scoped._metrics:
+            if overrides.revenue_include_returns:
+                scoped._metrics["net_revenue"] = scoped._metrics["net_revenue"].model_copy(
+                    update={
+                        "name": "Revenue (Including Returns)",
+                        "description": (
+                            "Total recognized revenue including returned items "
+                            "(User custom rule: including returns)."
+                        ),
+                        "sql_formula": "SUM(sale_price) WHERE status != 'Cancelled'",
+                        "business_rule": (
+                            "User-specified rule: includes returned items in revenue calculation."
+                        ),
+                    }
+                )
+            else:
+                scoped._metrics["net_revenue"] = DEFAULT_METRICS["net_revenue"]
+
+        if overrides.aov_include_returns is not None and "aov" in scoped._metrics:
+            if overrides.aov_include_returns:
+                scoped._metrics["aov"] = scoped._metrics["aov"].model_copy(
+                    update={
+                        "description": (
+                            "Average monetary value per order, including returned items "
+                            "(User custom rule: including returns)."
+                        ),
+                        "sql_formula": (
+                            "ROUND(SAFE_DIVIDE(SUM(sale_price), COUNT(DISTINCT order_id)), 2) "
+                            "WHERE status != 'Cancelled'"
+                        ),
+                        "business_rule": (
+                            "User-specified rule: includes returned items and excludes cancelled items."
+                        ),
+                    }
+                )
+            else:
+                scoped._metrics["aov"] = DEFAULT_METRICS["aov"]
+
+        return scoped
+
     def format_response_definitions(
         self,
         metrics: list[MetricDefinition] | None = None,
@@ -520,3 +717,23 @@ class SemanticGlossary:
                 )
 
         return "\n".join(lines)
+
+
+_ACTIVE_SESSION_GLOSSARY: ContextVar[SemanticGlossary | None] = ContextVar(
+    "active_session_glossary", default=None
+)
+
+
+def get_active_glossary(default: SemanticGlossary) -> SemanticGlossary:
+    """Return session-scoped glossary if active in context, otherwise the default instance."""
+    return _ACTIVE_SESSION_GLOSSARY.get() or default
+
+
+@contextmanager
+def session_glossary_scope(glossary: SemanticGlossary) -> Iterator[SemanticGlossary]:
+    """Bind a session-scoped SemanticGlossary to the current async execution context."""
+    token = _ACTIVE_SESSION_GLOSSARY.set(glossary)
+    try:
+        yield glossary
+    finally:
+        _ACTIVE_SESSION_GLOSSARY.reset(token)
