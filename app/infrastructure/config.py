@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,24 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.domain.models import UserContext, UserRole
+
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+
+def configure_logging(level: str = "INFO", log_file: str | Path | None = None) -> None:
+    """Configure standardized application logging to stdout or a log file."""
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+    if log_file is not None:
+        target = Path(log_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(
+            level=numeric_level,
+            format=LOG_FORMAT,
+            handlers=[logging.FileHandler(target, encoding="utf-8")],
+            force=True,
+        )
+        return
+    logging.basicConfig(level=numeric_level, format=LOG_FORMAT)
 
 
 def load_user_rbac_profiles(

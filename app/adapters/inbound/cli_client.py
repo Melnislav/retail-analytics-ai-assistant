@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -25,6 +26,7 @@ from app.domain.exceptions import (
 )
 from app.domain.models import ChatRequest, ConfirmationRequest, UserContext
 from app.infrastructure.config import (
+    configure_logging,
     get_settings,
     load_user_rbac_profiles,
     resolve_local_user_context,
@@ -496,6 +498,10 @@ class RetailAssistantCLI:
             from app.infrastructure.container import ApplicationContainer
 
             settings = get_settings()
+            log_dir = (
+                Path(settings.trace_log_path).parent if settings.trace_log_path else Path("logs")
+            )
+            configure_logging(settings.log_level, log_file=log_dir / "app.log")
             self.container = ApplicationContainer(settings)
             await self.container.startup()
 

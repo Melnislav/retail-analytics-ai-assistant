@@ -227,7 +227,7 @@ class StructuredObservabilityAdapter:
         }
         self._recent_spans.append(entry)
         self._recent_spans = self._recent_spans[-100:]
-        logger.info("SPAN %s", json.dumps(entry))
+        logger.debug("SPAN %s", json.dumps(entry))
 
     def increment_metric(self, metric_name: str, value: int = 1) -> None:
         self._counters[metric_name] += value

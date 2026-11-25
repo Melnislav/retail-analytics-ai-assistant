@@ -142,7 +142,7 @@ class ReportService:
             require_exact_match=True,
         )
         self._obs.increment_metric("reports_deleted_total", deleted_count)
-        logger.warning(
+        logger.info(
             "AUDIT: User %s confirmed deletion of %d report(s) (token=%s hash=%s)",
             user.user_id,
             deleted_count,

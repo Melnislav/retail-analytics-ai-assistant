@@ -262,16 +262,13 @@ class LangChainRetailAgentAdapter:
             raise
         except Exception as exc:
             logger.warning(
-                "All configured LLM providers (%s) failed during %s: %s",
+                "All configured LLM providers (%s) failed during %s (%s); "
+                "falling back to deterministic heuristic rules.",
                 ", ".join(entry.name for entry in self._providers),
                 task_name,
                 exc,
             )
 
-        logger.warning(
-            "Falling back to deterministic heuristic rules during %s.",
-            task_name,
-        )
         budget = get_active_turn_budget()
         if budget is not None:
             budget.record_fallback()

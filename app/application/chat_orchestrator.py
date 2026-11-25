@@ -175,7 +175,10 @@ class ChatOrchestratorService:
                 if validation.severity == "hard":
                     self._obs.increment_metric("sql_hard_policy_blocks_total")
                     logger.warning(
-                        "Attempt %d hard SQL policy block (0 retries): %s", attempt, error_msg
+                        "trace_id=%s Attempt %d hard SQL policy block (0 retries): %s",
+                        trace_id,
+                        attempt,
+                        self._mask_text(error_msg),
                     )
                     return {
                         "last_error": error_msg,
@@ -186,7 +189,10 @@ class ChatOrchestratorService:
                 soft_limit = min(1, max_additional_attempts)
                 if soft_retries >= soft_limit:
                     logger.warning(
-                        "Soft SQL formatting limit reached (%d): %s", soft_retries, error_msg
+                        "trace_id=%s Soft SQL formatting limit reached (%d): %s",
+                        trace_id,
+                        soft_retries,
+                        self._mask_text(error_msg),
                     )
                     return {
                         "last_error": error_msg,
@@ -195,11 +201,12 @@ class ChatOrchestratorService:
                     }
                 self._obs.increment_metric("sql_self_correction_attempts")
                 logger.warning(
-                    "Attempt %d soft SQL policy repair (%d/%d): %s",
+                    "trace_id=%s Attempt %d soft SQL policy repair (%d/%d): %s",
+                    trace_id,
                     attempt,
                     soft_retries + 1,
                     soft_limit,
-                    error_msg,
+                    self._mask_text(error_msg),
                 )
                 return {
                     "last_error": error_msg,
@@ -289,7 +296,11 @@ class ChatOrchestratorService:
                 }
             except QueryBudgetExceededError as exc:
                 self._obs.increment_metric("bq_budget_blocks_total")
-                logger.warning("Query byte budget exceeded (0 retries): %s", exc.message)
+                logger.warning(
+                    "trace_id=%s Query byte budget exceeded (0 retries): %s",
+                    trace_id,
+                    self._mask_text(exc.message),
+                )
                 return {
                     "last_error": exc.message,
                     "last_sql": secured_sql,
@@ -299,9 +310,10 @@ class ChatOrchestratorService:
                 if self._is_warehouse_infrastructure_error(exc):
                     self._obs.increment_metric("warehouse_unavailable_total")
                     logger.warning(
-                        "Attempt %d BigQuery infrastructure error (0 retries): %s",
+                        "trace_id=%s Attempt %d BigQuery infrastructure error (0 retries): %s",
+                        trace_id,
                         attempt,
-                        exc,
+                        self._mask_text(str(exc)),
                     )
                     infra_exc = (
                         exc
@@ -315,7 +327,12 @@ class ChatOrchestratorService:
                     }
                 err_msg = str(exc)
                 syntax_limit = min(2, max_additional_attempts)
-                logger.warning("Attempt %d BigQuery error: %s", attempt, err_msg)
+                logger.warning(
+                    "trace_id=%s Attempt %d BigQuery error: %s",
+                    trace_id,
+                    attempt,
+                    self._mask_text(err_msg),
+                )
                 if syntax_retries >= syntax_limit:
                     return {
                         "last_error": err_msg,
