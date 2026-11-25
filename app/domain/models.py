@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -136,6 +136,7 @@ class SQLValidationResult(BaseModel):
     sanitized_sql: str = ""
     violations: list[str] = Field(default_factory=list)
     applied_rbac_filters: list[str] = Field(default_factory=list)
+    severity: Literal["none", "soft", "hard"] = "none"
 
 
 class QueryExecutionResult(BaseModel):

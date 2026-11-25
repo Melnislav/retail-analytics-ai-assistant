@@ -19,10 +19,13 @@ from app.application.ports import (
     ObservabilityPort,
 )
 from app.application.report_service import ReportService
+from app.domain.budget import TurnBudget, turn_budget_scope
 from app.domain.exceptions import (
     ConfirmationValidationError,
+    QueryBudgetExceededError,
     QueryExecutionError,
     SQLSafetyError,
+    TurnBudgetExceededError,
 )
 from app.domain.input_safety import InputSafetyPolicy
 from app.domain.models import (
@@ -55,6 +58,10 @@ class AnalysisWorkflowState(TypedDict, total=False):
     preferences: UserPreferenceProfile
     trace_id: str
     attempt: int
+    soft_retries: int
+    syntax_retries: int
+    empty_retries: int
+    budget: TurnBudget
     sql_plan: SQLPlan | None
     query_result: QueryExecutionResult | None
     synthesis: AnalystSynthesis | None
@@ -78,6 +85,8 @@ class ChatOrchestratorService:
         pii_masker: PIIMasker,
         sql_policy: SQLPolicyEngine,
         max_sql_retries: int = 3,
+        max_llm_calls_per_turn: int = 5,
+        max_turn_cost_usd: float = 1.0,
         cache_ttl_seconds: int = 300,
         chat_history_limit: int = 10,
         default_persona_tone: str = PersonaConfig().tone_instructions,
@@ -95,6 +104,8 @@ class ChatOrchestratorService:
         self._masker = pii_masker
         self._sql_policy = sql_policy
         self._max_sql_retries = max_sql_retries
+        self._max_llm_calls_per_turn = max_llm_calls_per_turn
+        self._max_turn_cost_usd = max_turn_cost_usd
         self._cache_ttl = cache_ttl_seconds
         self._chat_history_limit = chat_history_limit
         self._glossary = glossary or SemanticGlossary()
@@ -109,6 +120,9 @@ class ChatOrchestratorService:
             t_sql = time.perf_counter()
             attempt = state.get("attempt", 1)
             trace_id = state.get("trace_id", "")
+            budget = state.get("budget")
+            if budget is not None:
+                budget.check_can_call()
             plan = await self._llm.generate_sql_plan(
                 user_message=state["user_message"],
                 schema_summary=state["schema_summary"],
@@ -117,6 +131,8 @@ class ChatOrchestratorService:
                 previous_error=state.get("last_error"),
                 previous_sql=state.get("last_sql"),
             )
+            if budget is not None:
+                budget.record_call()
             if trace_id:
                 self._obs.record_span(
                     trace_id,
@@ -133,22 +149,50 @@ class ChatOrchestratorService:
 
             applied_defs = list(plan.applied_metric_definitions) if plan else []
             attempt = state.get("attempt", 1)
+            soft_retries = state.get("soft_retries", 0)
+            syntax_retries = state.get("syntax_retries", 0)
+            empty_retries = state.get("empty_retries", 0)
             trace_id = state.get("trace_id", "")
             user = state["user_context"]
+            max_additional_attempts = max(0, self._max_sql_retries - 1)
 
             validation = self._sql_policy.validate_and_secure(plan.sql_query, user)
             if not validation.is_valid:
                 error_msg = f"SQL Policy Violation: {'; '.join(validation.violations)}"
+                if validation.severity == "hard":
+                    self._obs.increment_metric("sql_hard_policy_blocks_total")
+                    logger.warning(
+                        "Attempt %d hard SQL policy block (0 retries): %s", attempt, error_msg
+                    )
+                    return {
+                        "last_error": error_msg,
+                        "last_sql": plan.sql_query,
+                        "fatal_error": SQLSafetyError(error_msg),
+                    }
+
+                soft_limit = min(1, max_additional_attempts)
+                if soft_retries >= soft_limit:
+                    logger.warning(
+                        "Soft SQL formatting limit reached (%d): %s", soft_retries, error_msg
+                    )
+                    return {
+                        "last_error": error_msg,
+                        "last_sql": plan.sql_query,
+                        "fatal_error": SQLSafetyError(error_msg),
+                    }
                 self._obs.increment_metric("sql_self_correction_attempts")
-                logger.warning("Attempt %d SQL policy rejected: %s", attempt, error_msg)
-                policy_fatal: Exception | None = (
-                    SQLSafetyError(error_msg) if attempt >= self._max_sql_retries else None
+                logger.warning(
+                    "Attempt %d soft SQL policy repair (%d/%d): %s",
+                    attempt,
+                    soft_retries + 1,
+                    soft_limit,
+                    error_msg,
                 )
                 return {
                     "last_error": error_msg,
                     "last_sql": plan.sql_query,
                     "attempt": attempt + 1,
-                    "fatal_error": policy_fatal,
+                    "soft_retries": soft_retries + 1,
                 }
 
             secured_sql = validation.sanitized_sql
@@ -185,7 +229,8 @@ class ChatOrchestratorService:
                         {"row_count": raw_result.row_count},
                     )
 
-                if raw_result.row_count == 0 and attempt < self._max_sql_retries:
+                empty_limit = min(1, max_additional_attempts)
+                if raw_result.row_count == 0 and empty_retries < empty_limit:
                     err_msg = (
                         "Query executed cleanly but returned 0 rows. Verify filter literals "
                         "(e.g., case sensitivity, date ranges, or status values) and broaden filters if appropriate."
@@ -195,6 +240,7 @@ class ChatOrchestratorService:
                         "last_error": err_msg,
                         "last_sql": secured_sql,
                         "attempt": attempt + 1,
+                        "empty_retries": empty_retries + 1,
                     }
 
                 guarded_rows, guard_redactions = self._apply_post_sql_guard(raw_result.rows)
@@ -209,11 +255,12 @@ class ChatOrchestratorService:
                     attempts=attempt,
                     applied_metric_definitions=applied_defs,
                 )
-                await self._cache.set_json(
-                    cache_key,
-                    result.model_dump(exclude={"from_cache", "attempts"}),
-                    ttl_seconds=self._cache_ttl,
-                )
+                if result.row_count > 0:
+                    await self._cache.set_json(
+                        cache_key,
+                        result.model_dump(exclude={"from_cache", "attempts"}),
+                        ttl_seconds=self._cache_ttl,
+                    )
                 return {
                     "query_result": result,
                     "last_sql": secured_sql,
@@ -221,23 +268,33 @@ class ChatOrchestratorService:
                         state.get("redactions_count", 0) + guard_redactions + row_redactions
                     ),
                 }
+            except QueryBudgetExceededError as exc:
+                self._obs.increment_metric("bq_budget_blocks_total")
+                logger.warning("Query byte budget exceeded (0 retries): %s", exc.message)
+                return {
+                    "last_error": exc.message,
+                    "last_sql": secured_sql,
+                    "fatal_error": exc,
+                }
             except Exception as exc:
                 err_msg = str(exc)
-                self._obs.increment_metric("sql_self_correction_attempts")
+                syntax_limit = min(2, max_additional_attempts)
                 logger.warning("Attempt %d BigQuery error: %s", attempt, err_msg)
-                exec_fatal: Exception | None = (
-                    QueryExecutionError(
-                        f"Unable to execute a valid analytical query after {self._max_sql_retries} attempts: {err_msg}",
-                        last_sql=secured_sql,
-                    )
-                    if attempt >= self._max_sql_retries
-                    else None
-                )
+                if syntax_retries >= syntax_limit:
+                    return {
+                        "last_error": err_msg,
+                        "last_sql": secured_sql,
+                        "fatal_error": QueryExecutionError(
+                            f"Unable to execute a valid analytical query after {attempt} attempt(s): {err_msg}",
+                            last_sql=secured_sql,
+                        ),
+                    }
+                self._obs.increment_metric("sql_self_correction_attempts")
                 return {
                     "last_error": err_msg,
                     "last_sql": secured_sql,
                     "attempt": attempt + 1,
-                    "fatal_error": exec_fatal,
+                    "syntax_retries": syntax_retries + 1,
                 }
 
         async def synthesize_node(state: AnalysisWorkflowState) -> dict[str, Any]:
@@ -250,6 +307,9 @@ class ChatOrchestratorService:
                     detailed_analysis="",
                 )
             else:
+                budget = state.get("budget")
+                if budget is not None:
+                    budget.check_can_call()
                 synthesis = await self._llm.synthesize_response(
                     user_message=state["user_message"],
                     query_result=state.get("query_result"),
@@ -257,6 +317,8 @@ class ChatOrchestratorService:
                     preferences=state["preferences"],
                     history=state["history"],
                 )
+                if budget is not None:
+                    budget.record_call()
             if trace_id:
                 self._obs.record_span(
                     trace_id,
@@ -272,7 +334,7 @@ class ChatOrchestratorService:
             sql_plan = state.get("sql_plan")
             if state.get("query_result") is not None or (sql_plan and not sql_plan.requires_sql):
                 return "synthesize"
-            if state.get("last_error") and state.get("attempt", 1) <= self._max_sql_retries:
+            if state.get("last_error"):
                 return "generate_sql"
             return END
 
@@ -390,140 +452,214 @@ class ChatOrchestratorService:
                 observability={"trace_id": trace_id, "blocked": True, "pre_guard": True},
             )
 
-        # 1. Safety Guardrail & Intent Classification
-        t0 = time.perf_counter()
-        decision = await self._llm.classify_and_guard(safe_message, history)
-        self._obs.record_span(
-            trace_id,
-            "guardrail_classification",
-            (time.perf_counter() - t0) * 1000,
-            {"intent": decision.intent.value, "is_safe": decision.is_safe},
+        budget = TurnBudget(
+            max_llm_calls=self._max_llm_calls_per_turn,
+            max_cost_usd=self._max_turn_cost_usd,
         )
+        try:
+            with turn_budget_scope(budget):
+                # 1. Safety Guardrail & Intent Classification
+                budget.check_can_call()
+                t0 = time.perf_counter()
+                decision = await self._llm.classify_and_guard(safe_message, history)
+                budget.record_call()
+                self._obs.record_span(
+                    trace_id,
+                    "guardrail_classification",
+                    (time.perf_counter() - t0) * 1000,
+                    {"intent": decision.intent.value, "is_safe": decision.is_safe},
+                )
 
-        if not decision.is_safe or decision.intent in {
-            IntentType.BLOCKED_OFF_TOPIC,
-            IntentType.BLOCKED_INJECTION,
-        }:
-            self._obs.increment_metric("guardrail_blocks_total")
-            refusal = self._mask_text(
-                decision.rejection_reason
-                or "I am an executive retail data analysis assistant and can only answer questions related to retail sales, customers, products, and saved reports."
+                if not decision.is_safe or decision.intent in {
+                    IntentType.BLOCKED_OFF_TOPIC,
+                    IntentType.BLOCKED_INJECTION,
+                }:
+                    self._obs.increment_metric("guardrail_blocks_total")
+                    refusal = self._mask_text(
+                        decision.rejection_reason
+                        or "I am an executive retail data analysis assistant and can only answer questions related to retail sales, customers, products, and saved reports."
+                    )
+                    await self._cache.append_chat_message(
+                        request.session_id, ChatMessage(role="assistant", content=refusal)
+                    )
+                    return ChatResponse(
+                        session_id=request.session_id,
+                        trace_id=trace_id,
+                        reply=refusal,
+                        observability={
+                            "trace_id": trace_id,
+                            "blocked": True,
+                            **budget.to_dict(),
+                        },
+                    )
+
+                # Preferences apply to this response only; persistence is design-only for the prototype.
+                prefs = UserPreferenceProfile(user_id=user.user_id)
+                if decision.detected_format_preference is not None:
+                    prefs.preferred_format = decision.detected_format_preference
+                if decision.detected_depth_preference is not None:
+                    prefs.preferred_depth = decision.detected_depth_preference
+
+                # 3. High-Stakes Destructive Operation Flow (Saved Reports Deletion)
+                if decision.intent == IntentType.DELETE_REPORTS:
+                    pending = await self._reports.prepare_deletion(
+                        user=user,
+                        session_id=request.session_id,
+                        scope=decision.delete_scope or "keyword",
+                        keyword=decision.delete_keyword,
+                    )
+                    if pending is None:
+                        reply = (
+                            "No matching saved reports owned by your account were found to delete."
+                        )
+                        await self._cache.append_chat_message(
+                            request.session_id, ChatMessage(role="assistant", content=reply)
+                        )
+                        return ChatResponse(
+                            session_id=request.session_id,
+                            trace_id=trace_id,
+                            reply=reply,
+                            observability={"trace_id": trace_id, **budget.to_dict()},
+                        )
+
+                    safe_pending = pending.model_copy(
+                        update={
+                            "description": self._mask_text(pending.description),
+                            "target_report_titles": [
+                                self._mask_text(title) for title in pending.target_report_titles
+                            ],
+                        }
+                    )
+                    bullet_lines: list[str] = []
+                    for idx, title in enumerate(safe_pending.target_report_titles):
+                        rid = (
+                            safe_pending.target_report_ids[idx][:8]
+                            if idx < len(safe_pending.target_report_ids)
+                            else "unknown"
+                        )
+                        created = (
+                            safe_pending.target_report_created_at[idx]
+                            if idx < len(safe_pending.target_report_created_at)
+                            else ""
+                        )
+                        created_suffix = f" ({created})" if created else ""
+                        bullet_lines.append(f"- `{rid}` — **{title}**{created_suffix}")
+                    titles_bullets = "\n".join(bullet_lines)
+                    hash_preview = (
+                        safe_pending.payload_hash[:12] if safe_pending.payload_hash else "n/a"
+                    )
+                    reply = (
+                        f"**Confirmation Required (Destructive Action)**\n"
+                        f"{safe_pending.description}\n\n"
+                        f"Matched reports:\n{titles_bullets}\n\n"
+                        f"Snapshot hash: `{hash_preview}`\n"
+                        f"Please confirm using token `{safe_pending.token}` (or approve in the prompt) before I permanently delete them."
+                    )
+                    await self._cache.append_chat_message(
+                        request.session_id, ChatMessage(role="assistant", content=reply)
+                    )
+                    return ChatResponse(
+                        session_id=request.session_id,
+                        trace_id=trace_id,
+                        reply=reply,
+                        pending_confirmation=safe_pending,
+                        observability={
+                            "trace_id": trace_id,
+                            "awaiting_confirmation": True,
+                            **budget.to_dict(),
+                        },
+                    )
+
+                # 4. List Saved Reports Shortcut
+                if decision.intent == IntentType.LIST_REPORTS:
+                    reports = await self._reports.list_user_reports(user)
+                    if not reports:
+                        reply = "You currently have no saved reports."
+                    else:
+                        lines = [
+                            f"- **{r.title}** (`{r.report_id[:8]}...`, {r.created_at.strftime('%Y-%m-%d %H:%M UTC')})"
+                            for r in reports
+                        ]
+                        reply = self._mask_text("Here are your saved reports:\n" + "\n".join(lines))
+                    await self._cache.append_chat_message(
+                        request.session_id, ChatMessage(role="assistant", content=reply)
+                    )
+                    return ChatResponse(
+                        session_id=request.session_id,
+                        trace_id=trace_id,
+                        reply=reply,
+                        observability={"trace_id": trace_id, **budget.to_dict()},
+                    )
+
+                # Golden knowledge retrieval and dynamic persona storage are design-only in this prototype.
+                t_ret = time.perf_counter()
+                schema_summary = await self._warehouse.get_all_schemas_summary()
+                self._obs.record_span(
+                    trace_id,
+                    "schema_retrieval",
+                    (time.perf_counter() - t_ret) * 1000,
+                )
+
+                # 6. LangGraph Workflow (SQL Generation + Safety Validation + Differentiated Retry + Executive Synthesis)
+                workflow_state = await self._analysis_graph.ainvoke(
+                    {
+                        "user_message": safe_message,
+                        "user_context": user,
+                        "history": history,
+                        "schema_summary": schema_summary,
+                        "preferences": prefs,
+                        "trace_id": trace_id,
+                        "attempt": 1,
+                        "soft_retries": 0,
+                        "syntax_retries": 0,
+                        "empty_retries": 0,
+                        "budget": budget,
+                    }
+                )
+
+                fatal = workflow_state.get("fatal_error")
+                if isinstance(fatal, QueryBudgetExceededError):
+                    budget_reply = self._mask_text(
+                        f"{fatal.message} Please narrow the date range or add specific category/brand filters."
+                    )
+                    await self._cache.append_chat_message(
+                        request.session_id, ChatMessage(role="assistant", content=budget_reply)
+                    )
+                    return ChatResponse(
+                        session_id=request.session_id,
+                        trace_id=trace_id,
+                        reply=budget_reply,
+                        sql_used=(
+                            self._mask_text(workflow_state["last_sql"])
+                            if workflow_state.get("last_sql")
+                            else None
+                        ),
+                        observability={
+                            "trace_id": trace_id,
+                            "bq_budget_exceeded": True,
+                            **budget.to_dict(),
+                        },
+                    )
+                if fatal is not None:
+                    raise fatal
+        except TurnBudgetExceededError as exc:
+            self._obs.increment_metric("turn_budget_exceeded_total")
+            budget_reply = self._mask_text(
+                f"Turn budget reached ({exc.message}). Please narrow your question and retry."
             )
             await self._cache.append_chat_message(
-                request.session_id, ChatMessage(role="assistant", content=refusal)
+                request.session_id, ChatMessage(role="assistant", content=budget_reply)
             )
             return ChatResponse(
                 session_id=request.session_id,
                 trace_id=trace_id,
-                reply=refusal,
-                observability={"trace_id": trace_id, "blocked": True},
+                reply=budget_reply,
+                observability={
+                    "trace_id": trace_id,
+                    "budget_exceeded": True,
+                    **budget.to_dict(),
+                },
             )
-
-        # Preferences apply to this response only; persistence is design-only for the prototype.
-        prefs = UserPreferenceProfile(user_id=user.user_id)
-        if decision.detected_format_preference is not None:
-            prefs.preferred_format = decision.detected_format_preference
-        if decision.detected_depth_preference is not None:
-            prefs.preferred_depth = decision.detected_depth_preference
-
-        # 3. High-Stakes Destructive Operation Flow (Saved Reports Deletion)
-        if decision.intent == IntentType.DELETE_REPORTS:
-            pending = await self._reports.prepare_deletion(
-                user=user,
-                session_id=request.session_id,
-                scope=decision.delete_scope or "keyword",
-                keyword=decision.delete_keyword,
-            )
-            if pending is None:
-                reply = "No matching saved reports owned by your account were found to delete."
-                await self._cache.append_chat_message(
-                    request.session_id, ChatMessage(role="assistant", content=reply)
-                )
-                return ChatResponse(session_id=request.session_id, trace_id=trace_id, reply=reply)
-
-            safe_pending = pending.model_copy(
-                update={
-                    "description": self._mask_text(pending.description),
-                    "target_report_titles": [
-                        self._mask_text(title) for title in pending.target_report_titles
-                    ],
-                }
-            )
-            bullet_lines: list[str] = []
-            for idx, title in enumerate(safe_pending.target_report_titles):
-                rid = (
-                    safe_pending.target_report_ids[idx][:8]
-                    if idx < len(safe_pending.target_report_ids)
-                    else "unknown"
-                )
-                created = (
-                    safe_pending.target_report_created_at[idx]
-                    if idx < len(safe_pending.target_report_created_at)
-                    else ""
-                )
-                created_suffix = f" ({created})" if created else ""
-                bullet_lines.append(f"- `{rid}` — **{title}**{created_suffix}")
-            titles_bullets = "\n".join(bullet_lines)
-            hash_preview = safe_pending.payload_hash[:12] if safe_pending.payload_hash else "n/a"
-            reply = (
-                f"**Confirmation Required (Destructive Action)**\n"
-                f"{safe_pending.description}\n\n"
-                f"Matched reports:\n{titles_bullets}\n\n"
-                f"Snapshot hash: `{hash_preview}`\n"
-                f"Please confirm using token `{safe_pending.token}` (or approve in the prompt) before I permanently delete them."
-            )
-            await self._cache.append_chat_message(
-                request.session_id, ChatMessage(role="assistant", content=reply)
-            )
-            return ChatResponse(
-                session_id=request.session_id,
-                trace_id=trace_id,
-                reply=reply,
-                pending_confirmation=safe_pending,
-                observability={"trace_id": trace_id, "awaiting_confirmation": True},
-            )
-
-        # 4. List Saved Reports Shortcut
-        if decision.intent == IntentType.LIST_REPORTS:
-            reports = await self._reports.list_user_reports(user)
-            if not reports:
-                reply = "You currently have no saved reports."
-            else:
-                lines = [
-                    f"- **{r.title}** (`{r.report_id[:8]}...`, {r.created_at.strftime('%Y-%m-%d %H:%M UTC')})"
-                    for r in reports
-                ]
-                reply = self._mask_text("Here are your saved reports:\n" + "\n".join(lines))
-            await self._cache.append_chat_message(
-                request.session_id, ChatMessage(role="assistant", content=reply)
-            )
-            return ChatResponse(session_id=request.session_id, trace_id=trace_id, reply=reply)
-
-        # Golden knowledge retrieval and dynamic persona storage are design-only in this prototype.
-        t_ret = time.perf_counter()
-        schema_summary = await self._warehouse.get_all_schemas_summary()
-        self._obs.record_span(
-            trace_id,
-            "schema_retrieval",
-            (time.perf_counter() - t_ret) * 1000,
-        )
-
-        # 6. LangGraph Workflow (SQL Generation + Safety Validation + Self-Correction Retry + Executive Synthesis)
-        workflow_state = await self._analysis_graph.ainvoke(
-            {
-                "user_message": safe_message,
-                "user_context": user,
-                "history": history,
-                "schema_summary": schema_summary,
-                "preferences": prefs,
-                "trace_id": trace_id,
-                "attempt": 1,
-            }
-        )
-
-        fatal = workflow_state.get("fatal_error")
-        if fatal is not None:
-            raise fatal
 
         query_result = workflow_state.get("query_result")
         synthesis = workflow_state.get("synthesis")
@@ -611,7 +747,9 @@ class ChatOrchestratorService:
                 "total_latency_ms": total_ms,
                 "sql_attempts": query_result.attempts if query_result else 0,
                 "from_cache": query_result.from_cache if query_result else False,
+                "bytes_processed": query_result.bytes_processed if query_result else 0,
                 "pii_redactions": pii_redactions_total,
+                **budget.to_dict(),
             },
         )
 

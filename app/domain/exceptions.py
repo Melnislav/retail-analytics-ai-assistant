@@ -62,3 +62,17 @@ class ExternalServiceUnavailableError(DomainError):
     def __init__(self, service: str, message: str) -> None:
         super().__init__(f"{service} unavailable: {message}", code="SERVICE_UNAVAILABLE")
         self.service = service
+
+
+class QueryBudgetExceededError(DomainError):
+    """Raised when a BigQuery dry-run estimate exceeds the configured byte limit."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="QUERY_BUDGET_EXCEEDED")
+
+
+class TurnBudgetExceededError(DomainError):
+    """Raised when per-turn LLM call count or estimated USD cost exceeds its ceiling."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="TURN_BUDGET_EXCEEDED")

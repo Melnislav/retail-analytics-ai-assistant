@@ -102,6 +102,8 @@ class ApplicationContainer:
             pii_masker=self.pii_masker,
             sql_policy=self.sql_policy,
             max_sql_retries=settings.max_sql_retries,
+            max_llm_calls_per_turn=settings.max_llm_calls_per_turn,
+            max_turn_cost_usd=settings.max_turn_cost_usd,
             cache_ttl_seconds=settings.cache_ttl_seconds,
             chat_history_limit=settings.chat_history_limit,
             default_persona_tone=settings.default_persona_tone,

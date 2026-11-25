@@ -89,7 +89,7 @@ class Settings(BaseSettings):
     # LLM Provider (Primary & Fallback: Gemini, OpenRouter, OpenAI)
     llm_provider: str = Field(default="gemini", validation_alias="LLM_PROVIDER")
     google_api_key: str = Field(default="", validation_alias="GOOGLE_API_KEY")
-    gemini_model: str = Field(default="gemini-3.8-flash", validation_alias="GEMINI_MODEL")
+    gemini_model: str = Field(default="gemini-2.5-flash", validation_alias="GEMINI_MODEL")
     openrouter_api_key: str = Field(default="", validation_alias="OPENROUTER_API_KEY")
     openrouter_model: str = Field(
         default="google/gemma-4-31b-it:free", validation_alias="OPENROUTER_MODEL"
@@ -121,6 +121,8 @@ class Settings(BaseSettings):
 
     # Resilience & Persona
     max_sql_retries: int = Field(default=3, validation_alias="MAX_SQL_RETRIES")
+    max_llm_calls_per_turn: int = Field(default=5, ge=1, validation_alias="MAX_LLM_CALLS_PER_TURN")
+    max_turn_cost_usd: float = Field(default=1.0, gt=0.0, validation_alias="MAX_TURN_COST_USD")
     default_row_limit: int = Field(default=200, validation_alias="DEFAULT_ROW_LIMIT")
     default_persona_tone: str = Field(
         default=(

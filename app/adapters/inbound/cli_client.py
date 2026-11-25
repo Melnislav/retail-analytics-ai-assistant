@@ -15,6 +15,14 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
+from app.domain.exceptions import (
+    DomainError,
+    ExternalServiceUnavailableError,
+    QueryExecutionError,
+    SecurityViolationError,
+    SQLSafetyError,
+    UnauthorizedDataAccessError,
+)
 from app.domain.models import ChatRequest, ConfirmationRequest, UserContext
 from app.infrastructure.config import (
     get_settings,
@@ -108,6 +116,49 @@ class RetailAssistantCLI:
             )
         )
 
+    @staticmethod
+    def _render_standalone_error(exc: Exception) -> None:
+        if isinstance(exc, (SecurityViolationError, SQLSafetyError, UnauthorizedDataAccessError)):
+            console.print(
+                Panel(
+                    f"[bold red]{exc.message}[/bold red]",
+                    title="[bold red]Security / Policy Refusal[/bold red]",
+                    border_style="red",
+                )
+            )
+        elif isinstance(exc, QueryExecutionError):
+            console.print(
+                Panel(
+                    f"[bold yellow]{exc.message}[/bold yellow]",
+                    title="[bold yellow]Query Execution Error[/bold yellow]",
+                    border_style="yellow",
+                )
+            )
+        elif isinstance(exc, ExternalServiceUnavailableError):
+            console.print(
+                Panel(
+                    f"[bold red]{exc.message}[/bold red]",
+                    title="[bold red]Service Unavailable[/bold red]",
+                    border_style="red",
+                )
+            )
+        elif isinstance(exc, DomainError):
+            console.print(
+                Panel(
+                    f"[bold yellow]{exc.message}[/bold yellow]",
+                    title="[bold yellow]Request Error[/bold yellow]",
+                    border_style="yellow",
+                )
+            )
+        else:
+            console.print(
+                Panel(
+                    f"[bold red]Unexpected error:[/bold red] {exc}",
+                    title="[bold red]Unexpected Error[/bold red]",
+                    border_style="red",
+                )
+            )
+
     async def _send_chat(
         self, client: httpx.AsyncClient | None, text: str, save_flag: bool
     ) -> dict[str, Any] | None:
@@ -117,7 +168,11 @@ class RetailAssistantCLI:
                 message=text,
                 save_report=save_flag,
             )
-            res = await self.container.chat_orchestrator.handle_message(req, self.user_context)
+            try:
+                res = await self.container.chat_orchestrator.handle_message(req, self.user_context)
+            except Exception as exc:
+                self._render_standalone_error(exc)
+                return None
             return {
                 "reply": res.reply,
                 "sql_used": res.sql_used,
@@ -184,7 +239,11 @@ class RetailAssistantCLI:
                 token=token,
                 approved=approved,
             )
-            res = await self.container.chat_orchestrator.confirm_action(req, self.user_context)
+            try:
+                res = await self.container.chat_orchestrator.confirm_action(req, self.user_context)
+            except Exception as exc:
+                self._render_standalone_error(exc)
+                return None
             return {"reply": res.reply}
 
         if client is None:
@@ -208,7 +267,11 @@ class RetailAssistantCLI:
     async def _list_reports(self, client: httpx.AsyncClient | None) -> None:
         reports_list: list[dict[str, Any]] = []
         if self.standalone and self.container:
-            reports = await self.container.report_service.list_user_reports(self.user_context)
+            try:
+                reports = await self.container.report_service.list_user_reports(self.user_context)
+            except Exception as exc:
+                self._render_standalone_error(exc)
+                return
             reports_list = [r.model_dump() for r in reports]
         elif client:
             try:
@@ -245,9 +308,13 @@ class RetailAssistantCLI:
 
         report_data: dict[str, Any] | None = None
         if self.standalone and self.container:
-            report = await self.container.report_service.get_user_report(
-                self.user_context, normalized_id
-            )
+            try:
+                report = await self.container.report_service.get_user_report(
+                    self.user_context, normalized_id
+                )
+            except Exception as exc:
+                self._render_standalone_error(exc)
+                return
             report_data = report.model_dump(mode="json") if report else None
         elif client:
             try:

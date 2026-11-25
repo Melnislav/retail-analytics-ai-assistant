@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from app.domain.budget import get_active_turn_budget
+from app.domain.exceptions import TurnBudgetExceededError
 from app.domain.models import (
     AnalysisDepthPreference,
     AnalystSynthesis,
@@ -49,6 +51,7 @@ RETAIL_SIGNAL_PATTERN = re.compile(
 class LLMProvider:
     name: str
     model: BaseChatModel
+    model_name: str = ""
 
 
 class LangChainRetailAgentAdapter:
@@ -58,7 +61,7 @@ class LangChainRetailAgentAdapter:
         self,
         provider: str = "gemini",
         google_api_key: str = "",
-        gemini_model: str = "gemini-3.8-flash",
+        gemini_model: str = "gemini-2.5-flash",
         openrouter_api_key: str = "",
         openrouter_model: str = "google/gemma-4-31b-it:free",
         openrouter_base_url: str = "https://openrouter.ai/api/v1",
@@ -127,6 +130,7 @@ class LangChainRetailAgentAdapter:
                     LLMProvider(
                         name="gemini",
                         model=gemini_llm,
+                        model_name=gemini_model,
                     )
                 )
             except Exception as exc:
@@ -149,6 +153,7 @@ class LangChainRetailAgentAdapter:
                     LLMProvider(
                         name="openrouter",
                         model=openrouter_llm,
+                        model_name=openrouter_model,
                     )
                 )
             except Exception as exc:
@@ -170,6 +175,7 @@ class LangChainRetailAgentAdapter:
                     LLMProvider(
                         name="openai",
                         model=openai_llm,
+                        model_name=openai_model,
                     )
                 )
             except Exception as exc:
@@ -185,6 +191,29 @@ class LangChainRetailAgentAdapter:
         providers.sort(key=lambda p: 0 if p.name.lower() == provider.lower() else 1)
         return providers
 
+    def _record_token_usage(self, raw: Any) -> None:
+        budget = get_active_turn_budget()
+        if budget is None or raw is None:
+            return
+        usage = getattr(raw, "usage_metadata", None)
+        if not isinstance(usage, dict):
+            return
+        in_tokens = int(usage.get("input_tokens") or 0)
+        out_tokens = int(usage.get("output_tokens") or 0)
+        resp_meta = getattr(raw, "response_metadata", None)
+        model_name = (
+            str(resp_meta.get("model_name") or resp_meta.get("model") or "")
+            if isinstance(resp_meta, dict)
+            else ""
+        )
+        if not model_name and self._providers:
+            model_name = self._providers[0].model_name
+        budget.record_usage(
+            input_tokens=in_tokens,
+            output_tokens=out_tokens,
+            model_name=model_name,
+        )
+
     async def _invoke_with_resilience(
         self,
         schema: type[T],
@@ -196,13 +225,27 @@ class LangChainRetailAgentAdapter:
 
         safe_messages = self._mask_messages(messages)
 
-        structured_models = [
-            entry.model.with_structured_output(schema) for entry in self._providers
-        ]
+        structured_models: list[Any] = []
+        for entry in self._providers:
+            try:
+                structured_models.append(
+                    entry.model.with_structured_output(schema, include_raw=True)
+                )
+            except TypeError:
+                structured_models.append(entry.model.with_structured_output(schema))
         provider_chain = structured_models[0].with_fallbacks(structured_models[1:])
         try:
-            result = await provider_chain.ainvoke(safe_messages)  # type: ignore[arg-type]
+            result = await provider_chain.ainvoke(safe_messages)
+            if isinstance(result, dict) and ("parsed" in result or "raw" in result):
+                self._record_token_usage(result.get("raw"))
+                parsing_error = result.get("parsing_error")
+                parsed = result.get("parsed")
+                if parsing_error is not None or parsed is None:
+                    raise ValueError(f"Structured output parsing failed: {parsing_error}")
+                return cast(T, parsed)
             return cast(T, result)
+        except TurnBudgetExceededError:
+            raise
         except Exception as exc:
             logger.warning(
                 "All configured LLM providers (%s) failed during %s: %s",
@@ -604,10 +647,18 @@ class LangChainRetailAgentAdapter:
             f"{glossary_hint}"
             "Provide clear executive insights grounded strictly in the query data and concrete Q2/next-step action items."
         )
+        empty_notice = ""
+        if query_result is not None and query_result.row_count == 0:
+            empty_notice = (
+                "\nIMPORTANT: The executed query returned 0 rows. Do NOT fabricate numbers. "
+                "Explain clearly that no matching records were found within your authorized brand scope "
+                "and filters, and ask a clarifying question to broaden date ranges or filter criteria."
+            )
         prompt_body = (
             f"Executive Question: {user_message}\n"
             f"Executed SQL:\n{sql_used}\n\n"
-            f"Anonymized Query Results ({query_result.row_count if query_result else 0} rows):\n{rows_preview}"
+            f"Anonymized Query Results ({query_result.row_count if query_result else 0} rows):\n"
+            f"{rows_preview}{empty_notice}"
         )
         messages: list[SystemMessage | HumanMessage | AIMessage] = [
             SystemMessage(content=system_prompt),
@@ -644,7 +695,7 @@ class LangChainRetailAgentAdapter:
             else ""
         )
 
-        if query_result is None or not query_result.rows:
+        if query_result is None:
             return AnalystSynthesis(
                 executive_summary=(
                     f"Available dataset `{self._dataset_id}` includes `orders`, "
@@ -661,6 +712,29 @@ class LangChainRetailAgentAdapter:
                     "Compare state-level repeat purchase and return rates to identify regional bottlenecks.",
                 ],
                 report_title="Dataset Capability Overview",
+                used_metric_definitions=used_defs,
+            )
+
+        if not query_result.rows:
+            return AnalystSynthesis(
+                executive_summary=(
+                    "No matching records were found for this query within your authorized "
+                    "brand scope and active filters."
+                ),
+                detailed_analysis=(
+                    "The analytical query executed successfully against the warehouse, but "
+                    "returned 0 rows (either because the filters were too narrow or demographic "
+                    "groups were below the minimum privacy threshold)."
+                    f"{glossary_section}"
+                ),
+                action_items=[
+                    "Clarify or broaden the date range, product category, or brand/status filter and re-run.",
+                    "Check spelling and casing of any filter values mentioned in your question.",
+                ],
+                follow_up_suggestions=[
+                    "Would you like to expand the date window or relax one of the active filters?"
+                ],
+                report_title=f"No Matching Data: {user_message[:50]}",
                 used_metric_definitions=used_defs,
             )
 
