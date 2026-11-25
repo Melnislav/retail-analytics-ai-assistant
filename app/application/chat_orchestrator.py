@@ -374,36 +374,58 @@ class ChatOrchestratorService:
         return workflow.compile()
 
     async def confirm_action(self, request: ConfirmationRequest, user: UserContext) -> ChatResponse:
+        t_start = time.perf_counter()
         trace_id = f"tr_{uuid4().hex[:12]}"
-        self._obs.start_trace(
-            trace_id, user.user_id, request.session_id, f"CONFIRM:{request.token}"
-        )
-
-        pending = await self._confirmations.pop_pending(request.token, user.user_id)
-        if pending is None:
-            return ChatResponse(
-                session_id=request.session_id,
-                trace_id=trace_id,
-                reply="Confirmation token is invalid, expired, or belongs to another user. No reports were deleted.",
-            )
-
-        if not request.approved:
-            self._obs.increment_metric("destructive_confirmations_cancelled")
-            reply = f"Cancelled. Your {len(pending.target_report_ids)} report(s) remain untouched."
-            await self._cache.append_chat_message(
-                request.session_id, ChatMessage(role="assistant", content=reply)
-            )
-            return ChatResponse(
-                session_id=request.session_id,
-                trace_id=trace_id,
-                reply=reply,
-            )
+        prompt_text = f"CONFIRM:{request.token}:approved={request.approved}"
+        self._obs.start_trace(trace_id, user.user_id, request.session_id, prompt_text)
+        error_type: str | None = None
+        reply = ""
 
         try:
-            deleted_count = await self._reports.execute_confirmed_deletion(pending, user)
-        except ConfirmationValidationError as exc:
-            self._obs.increment_metric("destructive_confirmations_rejected")
-            reply = self._mask_text(exc.message)
+            pending = await self._confirmations.pop_pending(request.token, user.user_id)
+            if pending is None:
+                error_type = "ConfirmationNotFoundOrExpired"
+                reply = "Confirmation token is invalid, expired, or belongs to another user. No reports were deleted."
+                return ChatResponse(
+                    session_id=request.session_id,
+                    trace_id=trace_id,
+                    reply=reply,
+                )
+
+            if not request.approved:
+                self._obs.increment_metric("destructive_confirmations_cancelled")
+                reply = (
+                    f"Cancelled. Your {len(pending.target_report_ids)} report(s) remain untouched."
+                )
+                await self._cache.append_chat_message(
+                    request.session_id, ChatMessage(role="assistant", content=reply)
+                )
+                return ChatResponse(
+                    session_id=request.session_id,
+                    trace_id=trace_id,
+                    reply=reply,
+                )
+
+            try:
+                deleted_count = await self._reports.execute_confirmed_deletion(pending, user)
+            except ConfirmationValidationError as exc:
+                error_type = type(exc).__name__
+                self._obs.increment_metric("destructive_confirmations_rejected")
+                reply = self._mask_text(exc.message)
+                await self._cache.append_chat_message(
+                    request.session_id, ChatMessage(role="assistant", content=reply)
+                )
+                return ChatResponse(
+                    session_id=request.session_id,
+                    trace_id=trace_id,
+                    reply=reply,
+                )
+
+            short_ids = ", ".join(f"`{rid[:8]}`" for rid in pending.target_report_ids)
+            titles_str = ", ".join(f"'{t}'" for t in pending.target_report_titles)
+            reply = self._mask_text(
+                f"Confirmed and executed: deleted {deleted_count} report(s) [{short_ids}] ({titles_str})."
+            )
             await self._cache.append_chat_message(
                 request.session_id, ChatMessage(role="assistant", content=reply)
             )
@@ -412,20 +434,22 @@ class ChatOrchestratorService:
                 trace_id=trace_id,
                 reply=reply,
             )
-
-        short_ids = ", ".join(f"`{rid[:8]}`" for rid in pending.target_report_ids)
-        titles_str = ", ".join(f"'{t}'" for t in pending.target_report_titles)
-        reply = self._mask_text(
-            f"Confirmed and executed: deleted {deleted_count} report(s) [{short_ids}] ({titles_str})."
-        )
-        await self._cache.append_chat_message(
-            request.session_id, ChatMessage(role="assistant", content=reply)
-        )
-        return ChatResponse(
-            session_id=request.session_id,
-            trace_id=trace_id,
-            reply=reply,
-        )
+        except Exception as exc:
+            error_type = type(exc).__name__
+            raise
+        finally:
+            self._obs.finish_trace(
+                TraceRecord(
+                    trace_id=trace_id,
+                    user_id=user.user_id,
+                    session_id=request.session_id,
+                    intent_classified="confirm_delete_reports",
+                    latency_ms=round((time.perf_counter() - t_start) * 1000, 2),
+                    error_type=error_type,
+                    pii_redacted_prompt=prompt_text,
+                    pii_redacted_response=reply,
+                )
+            )
 
     async def handle_message(self, request: ChatRequest, user: UserContext) -> ChatResponse:
         t_start = time.perf_counter()

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+
+import pytest
 
 from app.adapters.inbound.cli_client import RetailAssistantCLI
 from app.infrastructure.config import load_user_rbac_profiles
@@ -54,3 +57,36 @@ def test_cli_client_resolves_rbac_details_without_authority_headers() -> None:
     assert cli.user_context.user_id == "mgr_bob"
     assert cli.user_context.role.value == "brand_manager"
     assert cli.user_context.allowed_brands == ["Diesel", "Tommy Hilfiger"]
+
+
+@pytest.mark.asyncio
+async def test_cli_user_switch_allowed_in_standalone_and_blocked_in_http_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    http_cli = RetailAssistantCLI(user_key="brand_manager_alice", standalone=False)
+    http_inputs = iter(["/user ceo", "/exit"])
+    monkeypatch.setattr("rich.prompt.Prompt.ask", lambda *_args, **_kwargs: next(http_inputs))
+    await asyncio.wait_for(http_cli.run(), timeout=5.0)
+    http_out = capsys.readouterr().out
+    assert http_cli.user_id == "mgr_alice"
+    assert "cannot switch personas in http mode" in http_out.lower()
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path}/cli_switch.db")
+    monkeypatch.setenv("REDIS_URL", "redis://invalid-host-uses-memory-fallback:6379/0")
+    monkeypatch.setenv("BIGQUERY_MOCK_MODE", "true")
+    monkeypatch.setenv("TRACE_LOG_PATH", str(tmp_path / "cli_traces.jsonl"))
+    from app.infrastructure.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        standalone_cli = RetailAssistantCLI(user_key="brand_manager_alice", standalone=True)
+        standalone_inputs = iter(["/user ceo", "/exit"])
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", lambda *_args, **_kwargs: next(standalone_inputs)
+        )
+        await asyncio.wait_for(standalone_cli.run(), timeout=5.0)
+        standalone_out = capsys.readouterr().out
+        assert standalone_cli.user_id == "ceo_carol"
+        assert "switched active user" in standalone_out.lower()
+    finally:
+        get_settings.cache_clear()

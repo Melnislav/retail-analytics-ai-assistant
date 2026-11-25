@@ -10,7 +10,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.adapters.inbound.cli_client import RetailAssistantCLI
 from app.domain.exceptions import SQLSafetyError
-from app.domain.models import ChatRequest, SQLPlan, UserContext, UserRole
+from app.domain.models import ChatRequest, ConfirmationRequest, SQLPlan, UserContext, UserRole
 from app.infrastructure.config import Settings
 from app.infrastructure.container import ApplicationContainer
 from app.main import app
@@ -146,5 +146,17 @@ async def test_traces_api_and_cli_inspection_are_owner_scoped(
         assert "Agent Observability Metrics" in cli_out
         assert "latency_ms" in cli_out
         assert alice_resp.trace_id in cli_out
+
+        # Confirmation actions also emit TraceRecord entries into logs/agent_traces.jsonl
+        confirm_resp = await container.chat_orchestrator.confirm_action(
+            ConfirmationRequest(session_id="obs_alice", token="confirm_missing999", approved=True),
+            alice,
+        )
+        confirm_trace = container.observability.get_trace(
+            confirm_resp.trace_id, user_id=alice.user_id
+        )
+        assert confirm_trace is not None
+        assert confirm_trace.intent_classified == "confirm_delete_reports"
+        assert confirm_trace.error_type == "ConfirmationNotFoundOrExpired"
     finally:
         await container.shutdown()

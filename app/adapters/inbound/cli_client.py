@@ -81,9 +81,9 @@ class RetailAssistantCLI:
                 f"[bold cyan]{app_title} (CLI)[/bold cyan]\n"
                 f"User: [green]{self.user_name}[/green] (`{self.user_id}`, role=`{self.user_role}`)\n"
                 f"Session: [yellow]{self.session_id}[/yellow] | Mode: [magenta]{mode_str}[/magenta]\n"
-                "Commands: [bold]/help[/bold], [bold]/users[/bold], [bold]/user <id>[/bold], [bold]/clear[/bold], "
+                "Commands: [bold]/help[/bold], [bold]/users[/bold], [bold]/user <id>[/bold] (standalone), [bold]/clear[/bold], "
                 "[bold]/reports[/bold], [bold]/report <id>[/bold], [bold]/save <question>[/bold], "
-                "[bold]/metrics[/bold], [bold]/trace [id][/bold], [bold]/exit[/bold]",
+                "[bold]/metrics[/bold], [bold]/trace \\[id][/bold], [bold]/exit[/bold]",
                 border_style="cyan",
             )
         )
@@ -106,13 +106,13 @@ class RetailAssistantCLI:
                 '   • "Delete all reports made in this conversation"\n\n'
                 "[bold yellow]Available Commands:[/bold yellow]\n"
                 "• [bold]/users[/bold] - List available RBAC profiles from configs/users_rbac.yaml\n"
-                "• [bold]/user <name>[/bold] - Switch persona (e.g. /user ceo or /user alice)\n"
+                "• [bold]/user <name>[/bold] - Switch persona in --standalone mode (e.g. /user ceo)\n"
                 "• [bold]/clear[/bold] - Reset session conversation memory\n"
                 "• [bold]/reports[/bold] - List your saved reports\n"
                 "• [bold]/report <id>[/bold] - View a full saved report (question, SQL, and answer)\n"
                 "• [bold]/save <query>[/bold] - Ask question and save executive report\n"
                 "• [bold]/metrics[/bold] - Show local agent counters and latency percentiles\n"
-                "• [bold]/trace [id][/bold] - Inspect recent execution traces or a specific trace ID\n"
+                "• [bold]/trace \\[id][/bold] - Inspect recent execution traces or a specific trace ID\n"
                 "• [bold]/exit[/bold] - Exit CLI",
                 title="[bold green]Retail Assistant Help & Sample Queries[/bold green]",
                 border_style="green",
@@ -533,6 +533,13 @@ class RetailAssistantCLI:
                     continue
 
                 if text.lower().startswith("/user "):
+                    if not self.standalone:
+                        console.print(
+                            "[yellow]Cannot switch personas in HTTP mode: the API enforces its "
+                            "server-configured PROTOTYPE_USER_PROFILE. Run with --standalone to "
+                            "switch profiles locally.[/yellow]"
+                        )
+                        continue
                     target_key = text.split(maxsplit=1)[1].strip()
                     profiles = load_user_rbac_profiles()
                     match = profiles.get(target_key)
