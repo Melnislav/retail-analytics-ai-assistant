@@ -151,3 +151,34 @@ async def test_session_glossary_overrides_persist_within_session_without_global_
         assert "between 1 and 365 days" in r_bad.reply.lower()
     finally:
         await container.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_churn_query_with_months_window_keeps_default_90_day_definition(
+    tmp_path: Path,
+) -> None:
+    glossary = SemanticGlossary()
+    query = "What was our monthly churn rate for the last 6 months?"
+    assert glossary.churn_inactivity_days(query) == 90
+
+    detected = glossary.detect_metrics(query)
+    churn_metric = next((m for m in detected if m.key == "churn_rate"), None)
+    assert churn_metric is not None
+    assert "last 90 days" in churn_metric.description
+    assert "User custom rule" not in churn_metric.description
+
+    container = ApplicationContainer(_session_test_settings(tmp_path))
+    await container.startup()
+    ceo = UserContext(user_id="ceo_1", role=UserRole.CEO)
+
+    try:
+        resp = await container.chat_orchestrator.handle_message(
+            ChatRequest(session_id="sess_ev03", message=query),
+            ceo,
+        )
+        assert resp.sql_used is not None
+        assert "INTERVAL '90' DAY" in resp.sql_used or "INTERVAL 90 DAY" in resp.sql_used
+        assert any("90 days" in d for d in resp.used_metric_definitions)
+        assert "6 days" not in resp.reply
+    finally:
+        await container.shutdown()

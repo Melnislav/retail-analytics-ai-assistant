@@ -197,6 +197,12 @@ DEFAULT_METRIC_CLARIFICATION_MESSAGES: dict[str, str] = {
 class SemanticGlossary:
     """Catalog of retail business metric definitions with prompt formatting and override support."""
 
+    _CHURN_DAY_PATTERNS: tuple[str, ...] = (
+        r"interval\s+(\d+)\s+day",
+        r"(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)[^\n.]{0,50}?\b(\d+)\s*(?:days?|дней|дня|дн)\b",
+        r"\b(\d+)\s*(?:days?|дней|дня|дн)\b[^\n.]{0,40}?(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)",
+    )
+
     def __init__(
         self,
         custom_definitions: dict[str, Any] | None = None,
@@ -278,16 +284,10 @@ class SemanticGlossary:
         )
         return "\n".join(lines)
 
-    @staticmethod
-    def _extract_churn_days(low: str) -> int | None:
+    @classmethod
+    def _extract_churn_days(cls, low: str) -> int | None:
         """Extract user-specified churn inactivity days (e.g., 60 days)."""
-        patterns = [
-            r"interval\s+(\d+)\s+day",
-            r"(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)[^\n.]{0,40}?(\d+)\s*(?:days?|дней|дня|дн)",
-            r"(\d+)\s*(?:days?|дней|дня|дн)[^\n.]{0,40}?(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)",
-            r"(?:churn|отток)[^\n.]{0,30}?(\d+)",
-        ]
-        for pat in patterns:
+        for pat in cls._CHURN_DAY_PATTERNS:
             match = re.search(pat, low)
             if match:
                 with contextlib.suppress(ValueError):
@@ -549,12 +549,7 @@ class SemanticGlossary:
         low = user_message.lower()
         churn_days: int | None = None
         if "churn" in low or "отток" in low:
-            day_patterns = [
-                r"interval\s+(\d+)\s+day",
-                r"(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)[^\n.]{0,50}?\b(\d+)\s*(?:days?|дней|дня|дн)\b",
-                r"\b(\d+)\s*(?:days?|дней|дня|дн)\b[^\n.]{0,40}?(?:churn|отток|inactivity|покупок|purchase|purchases|orders?)",
-            ]
-            for pat in day_patterns:
+            for pat in self._CHURN_DAY_PATTERNS:
                 match = re.search(pat, low)
                 if match:
                     val = int(match.group(1))
