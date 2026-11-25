@@ -160,3 +160,91 @@ async def test_traces_api_and_cli_inspection_are_owner_scoped(
         assert confirm_trace.error_type == "ConfirmationNotFoundOrExpired"
     finally:
         await container.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_observability_tracks_zero_row_approval_and_disk_preload_across_restarts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.adapters.outbound.redis_and_telemetry import StructuredObservabilityAdapter
+    from app.domain.models import QueryExecutionResult, SavedReport
+
+    settings = _obs_test_settings(tmp_path, db_name="obs_extra.db")
+    container = ApplicationContainer(settings)
+    await container.startup()
+    try:
+        alice = container.prototype_user
+
+        # 1. Zero-row analytical query increments zero_row_queries_total
+        async def empty_bq(sql: str) -> QueryExecutionResult:
+            return QueryExecutionResult(
+                sql_executed=sql, rows=[], row_count=0, columns=["category"]
+            )
+
+        orig_execute = container.chat_orchestrator._warehouse.execute_query
+        monkeypatch.setattr(container.chat_orchestrator._warehouse, "execute_query", empty_bq)
+        empty_resp = await container.chat_orchestrator.handle_message(
+            ChatRequest(session_id="obs_zero", message="Show net revenue by category"),
+            alice,
+        )
+        assert empty_resp.row_count == 0
+        monkeypatch.setattr(container.chat_orchestrator._warehouse, "execute_query", orig_execute)
+
+        # 2. Approved deletion increments destructive_confirmations_approved
+        await container.report_service.save_report(
+            SavedReport(
+                owner_user_id=alice.user_id,
+                session_id="obs_del",
+                question="Revenue?",
+                title="Obs Delete Target",
+                summary="Sum",
+                content_markdown="Body",
+            )
+        )
+        pending = await container.report_service.prepare_deletion(
+            user=alice, session_id="obs_del", scope="conversation"
+        )
+        assert pending is not None
+        await container.chat_orchestrator.confirm_action(
+            ConfirmationRequest(session_id="obs_del", token=pending.token, approved=True),
+            alice,
+        )
+
+        counters = container.observability.get_metrics_snapshot()["counters"]
+        assert counters["zero_row_queries_total"] == 1
+        assert counters["destructive_confirmations_approved"] == 1
+
+        # 3. CLI /trace <id> shows token counts and redacted response preview
+        cli_alice = RetailAssistantCLI(user_key="brand_manager_alice", standalone=True)
+        cli_alice.container = container
+        await cli_alice._show_trace(None, empty_resp.trace_id)
+        trace_out = capsys.readouterr().out
+        assert "Tokens:" in trace_out
+        assert "Response (redacted):" in trace_out
+    finally:
+        await container.shutdown()
+
+    # 4. Restarted StructuredObservabilityAdapter retains historical disk traces even after new trace
+    restarted_obs = StructuredObservabilityAdapter(trace_log_path=settings.trace_log_path)
+    old_traces = restarted_obs.get_recent_traces(limit=10)
+    assert len(old_traces) == 2
+
+    restarted_container = ApplicationContainer(settings)
+    await restarted_container.startup()
+    try:
+        new_resp = await restarted_container.chat_orchestrator.handle_message(
+            ChatRequest(session_id="obs_after_restart", message="Show net revenue by category"),
+            restarted_container.prototype_user,
+        )
+        all_traces = restarted_container.observability.get_recent_traces(limit=10)
+        trace_ids = {t.trace_id for t in all_traces}
+        assert empty_resp.trace_id in trace_ids
+        assert new_resp.trace_id in trace_ids
+        assert (
+            restarted_container.observability.get_trace(
+                empty_resp.trace_id, user_id=restarted_container.prototype_user.user_id
+            )
+            is not None
+        )
+    finally:
+        await restarted_container.shutdown()

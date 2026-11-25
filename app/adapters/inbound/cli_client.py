@@ -421,6 +421,10 @@ class RetailAssistantCLI:
                 console.print(f"[yellow]Trace '{trace_id}' not found.[/yellow]")
                 return
 
+            raw_resp = str(record_data.get("pii_redacted_response") or "").strip()
+            resp_preview = (
+                (raw_resp[:300] + "...") if len(raw_resp) > 300 else (raw_resp or "(empty)")
+            )
             detail_md = (
                 f"**Trace ID:** `{record_data['trace_id']}` | **User:** `{record_data['user_id']}` | "
                 f"**Session:** `{record_data['session_id']}`  \n"
@@ -428,10 +432,12 @@ class RetailAssistantCLI:
                 f"**Fallback Used:** `{record_data.get('fallback_used')}`  \n"
                 f"**Latency:** {record_data.get('latency_ms', 0)} ms | "
                 f"**LLM Calls:** {record_data.get('llm_calls_count', 0)} | "
+                f"**Tokens:** in={record_data.get('input_tokens', 0)} / out={record_data.get('output_tokens', 0)} | "
                 f"**Cost:** ${record_data.get('total_cost_usd', 0):.6f} | "
                 f"**BQ Bytes:** {record_data.get('bq_bytes_billed', 0)}  \n"
                 f"**Error Type:** `{record_data.get('error_type')}`  \n"
-                f"**Prompt (redacted):** {record_data.get('pii_redacted_prompt', '')}\n\n"
+                f"**Prompt (redacted):** {record_data.get('pii_redacted_prompt', '')}  \n"
+                f"**Response (redacted):** {resp_preview}\n\n"
                 f"**SQL:**\n```sql\n{record_data.get('generated_sql') or '(none)'}\n```"
             )
             console.print(

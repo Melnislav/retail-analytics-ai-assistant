@@ -9,6 +9,7 @@ from typing import Any, TypeVar, cast
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableLambda
 
 from app.domain.budget import get_active_turn_budget
 from app.domain.exceptions import TurnBudgetExceededError
@@ -236,7 +237,17 @@ class LangChainRetailAgentAdapter:
                 )
             except TypeError:
                 structured_models.append(entry.model.with_structured_output(schema))
-        provider_chain = structured_models[0].with_fallbacks(structured_models[1:])
+
+        def _mark_provider_fallback(value: Any) -> Any:
+            budget = get_active_turn_budget()
+            if budget is not None:
+                budget.record_fallback()
+            return value
+
+        fallback_models = [
+            model | RunnableLambda(_mark_provider_fallback) for model in structured_models[1:]
+        ]
+        provider_chain = structured_models[0].with_fallbacks(fallback_models)
         try:
             result = await provider_chain.ainvoke(safe_messages)
             if isinstance(result, dict) and ("parsed" in result or "raw" in result):

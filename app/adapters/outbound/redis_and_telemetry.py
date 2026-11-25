@@ -151,9 +151,11 @@ class StructuredObservabilityAdapter:
     ) -> None:
         self._counters: dict[str, int] = defaultdict(int)
         self._recent_spans: list[dict[str, Any]] = []
-        self._recent_traces: list[TraceRecord] = []
         self._latencies_ms: list[float] = []
         self._trace_log_path = trace_log_path
+        self._recent_traces: list[TraceRecord] = (
+            self._load_traces_from_disk()[-200:] if trace_log_path else []
+        )
         self._pii_masker = pii_masker or PIIMasker()
         self._langfuse = None
         if langfuse_public_key and langfuse_secret_key:

@@ -271,6 +271,8 @@ class ChatOrchestratorService:
                     attempts=attempt,
                     applied_metric_definitions=applied_defs,
                 )
+                if result.row_count == 0:
+                    self._obs.increment_metric("zero_row_queries_total")
                 if result.row_count > 0:
                     await self._cache.set_json(
                         cache_key,
@@ -420,6 +422,8 @@ class ChatOrchestratorService:
                     trace_id=trace_id,
                     reply=reply,
                 )
+
+            self._obs.increment_metric("destructive_confirmations_approved")
 
             short_ids = ", ".join(f"`{rid[:8]}`" for rid in pending.target_report_ids)
             titles_str = ", ".join(f"'{t}'" for t in pending.target_report_titles)

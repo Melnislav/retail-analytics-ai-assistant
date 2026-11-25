@@ -69,6 +69,50 @@ async def test_langchain_native_fallback_uses_second_provider() -> None:
 
 
 @pytest.mark.asyncio
+async def test_langchain_native_fallback_marks_budget_fallback_used() -> None:
+    adapter = LangChainRetailAgentAdapter()
+
+    async def fail_primary(_messages: object) -> GuardrailDecision:
+        raise RuntimeError("primary unavailable")
+
+    expected = GuardrailDecision(intent=IntentType.DATA_ANALYSIS, is_safe=True)
+
+    async def use_fallback(_messages: object) -> GuardrailDecision:
+        return expected
+
+    primary = MagicMock()
+    primary.with_structured_output.return_value = RunnableLambda(fail_primary)
+    fallback = MagicMock()
+    fallback.with_structured_output.return_value = RunnableLambda(use_fallback)
+    adapter._providers = [
+        LLMProvider(name="primary", model=primary),
+        LLMProvider(name="fallback", model=fallback),
+    ]
+
+    budget = TurnBudget(max_llm_calls=5, max_cost_usd=1.0)
+    with turn_budget_scope(budget):
+        decision = await adapter.classify_and_guard("Show revenue by brand", [])
+
+    assert decision == expected
+    assert budget.fallback_used is True
+
+    # Primary succeeding must NOT set fallback_used
+    async def ok_primary(_messages: object) -> GuardrailDecision:
+        return expected
+
+    primary_ok = MagicMock()
+    primary_ok.with_structured_output.return_value = RunnableLambda(ok_primary)
+    adapter._providers = [
+        LLMProvider(name="primary", model=primary_ok),
+        LLMProvider(name="fallback", model=fallback),
+    ]
+    clean_budget = TurnBudget(max_llm_calls=5, max_cost_usd=1.0)
+    with turn_budget_scope(clean_budget):
+        await adapter.classify_and_guard("Show revenue by brand", [])
+    assert clean_budget.fallback_used is False
+
+
+@pytest.mark.asyncio
 async def test_langchain_all_failed_uses_heuristic() -> None:
     adapter = LangChainRetailAgentAdapter()
 
