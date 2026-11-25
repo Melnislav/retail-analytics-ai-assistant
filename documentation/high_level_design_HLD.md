@@ -181,14 +181,14 @@ flowchart TD
     PREP_DEL --> SHOW_DEL["Render Target Report List + Hash to User"]
     SHOW_DEL --> CONFIRM_DEL{"User Confirms Hash & Action?"}
     CONFIRM_DEL -->|Confirmed| EXEC_DEL["Transactional Delete + Security Audit Log"]
-    CONFIRM_DEL -->|Cancelled / Expired| ABORT_DEL["Abort Operation + Retain Data"]
+    CONFIRM_DEL -->|"Cancelled / Expired"| ABORT_DEL["Abort Operation + Retain Data"]
 
-    ROUTE -->|List / View Reports| READ_REP["ReportService.get_user_reports()<br/>(Strict author_id Filter)"]
+    ROUTE -->|"List / View Reports"| READ_REP["ReportService.get_user_reports()<br/>(Strict author_id Filter)"]
 
     ROUTE -->|Analytical Query| AST_VAL{"SQLPolicyEngine (SQLGlot AST)<br/>1. Single SELECT Only<br/>2. Allowlisted Tables Only<br/>3. Block PII & direct orders.gender<br/>4. Rewrite Brand CTE Isolation<br/>5. Inject HAVING COUNT(DISTINCT user_id) >= k"}
 
-    AST_VAL -->|Hard Violation (PII / Brand / DML)| FAILS_FAST["0 Retries: Fail Fast + Audit Security Violation"]
-    AST_VAL -->|Soft Format Failure (e.g. SELECT *)| SOFT_RETRY{"Soft Repair Attempt <= 1?"}
+    AST_VAL -->|"Hard Violation (PII / Brand / DML)"| FAILS_FAST["0 Retries: Fail Fast + Audit Security Violation"]
+    AST_VAL -->|"Soft Format Failure (e.g. SELECT *)"| SOFT_RETRY{"Soft Repair Attempt <= 1?"}
     SOFT_RETRY -->|Yes| LLM_PLAN
     SOFT_RETRY -->|No| REJECT_SOFT["Reject Query with Formatting Error"]
 
@@ -201,8 +201,8 @@ flowchart TD
     RETRY_SYN -->|No| GRACEFUL_ERR["Graceful Error Message"]
 
     BQ_EXEC -->|0 Rows Returned| RETRY_EMPTY{"Empty Repair Attempt <= 1?"}
-    RETRY_EMPTY -->|Yes: Widen Casing / Date Filter| LLM_PLAN
-    RETRY_EMPTY -->|No: Still 0 Rows| CLARIFY["Return Explanation + Ask Clarifying Question"]
+    RETRY_EMPTY -->|"Yes: Widen Casing / Date Filter"| LLM_PLAN
+    RETRY_EMPTY -->|"No: Still 0 Rows"| CLARIFY["Return Explanation + Ask Clarifying Question"]
 
     BQ_EXEC -->|Data Returned| POST_GUARD{"PostSQLDataGuard (Pandas)<br/>Verify Demographic Aggregates >= k"}
     POST_GUARD -->|Mask Below k| MASK_DF["Mask Rows Below k Threshold"]
