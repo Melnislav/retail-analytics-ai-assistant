@@ -94,10 +94,10 @@ flowchart TB
 ```
 
 ### Resource Sizing & Cost Justification
-* **Compute (ECS Fargate):** 1–2 tasks running 0.5 vCPU / 1 GB RAM effortlessly handle peak concurrency ($\sim 5$ concurrent requests during business peak hours) with average utilization $<20\%$. Estimated AWS compute cost: **~$$30/month**.
-* **Database (RDS PostgreSQL):** `db.t4g.small` multi-AZ instance is sufficient for storing saved reports, preferences, and vector embeddings for 100 managers. Estimated database cost: **~$$40/month**.
-* **Analytical Compute (Google BigQuery):** Queries run against `bigquery-public-data.thelook_ecommerce` (~100 MB per unaggregated query, controlled via AST projection and `dry_run` byte guards). At ~1,000 queries/day (~100 GB/day processed), total usage is ~3 TB/month. With 1 TB free tier, net cost is ~2 TB $\times$ $$6.25/TB = **~$$12.50/month**.
-* **LLM Compute (Gemini 2.5 Flash):** At ~1,000 questions/day with 2–3 calls per question (~2,500 calls/day, ~2M input tokens/day), cost under Gemini 2.5 Flash ($$0.15 / 1M input tokens) is **< $$0.50/day** (**~$$15.00/month**), well within the **$$1.00 per query ceiling limit**.
+* **Compute (ECS Fargate):** 1–2 tasks running 0.5 vCPU / 1 GB RAM effortlessly handle peak concurrency ($\sim 5$ concurrent requests during business peak hours) with average utilization $<20\%$. Estimated AWS compute cost: **~\$30/month**.
+* **Database (RDS PostgreSQL):** `db.t4g.small` multi-AZ instance is sufficient for storing saved reports, preferences, and vector embeddings for 100 managers. Estimated database cost: **~\$40/month**.
+* **Analytical Compute (Google BigQuery):** Queries run against `bigquery-public-data.thelook_ecommerce` (~100 MB per unaggregated query, controlled via AST projection and `dry_run` byte guards). At ~1,000 queries/day (~100 GB/day processed), total usage is ~3 TB/month. With 1 TB free tier, net cost is ~2 TB $\times$ \$6.25/TB = **~\$12.50/month**.
+* **LLM Compute (Gemini 2.5 Flash):** At ~1,000 questions/day with 2–3 calls per question (~2,500 calls/day, ~2M input tokens/day), cost under Gemini 2.5 Flash (\$0.15 / 1M input tokens) is **< \$0.50/day** (**~\$15.00/month**), well within the **\$1.00 per query ceiling limit**.
 
 ---
 
@@ -181,14 +181,14 @@ flowchart TD
     PREP_DEL --> SHOW_DEL["Render Target Report List + Hash to User"]
     SHOW_DEL --> CONFIRM_DEL{"User Confirms Hash & Action?"}
     CONFIRM_DEL -->|Confirmed| EXEC_DEL["Transactional Delete + Security Audit Log"]
-    CONFIRM_DEL -->|Cancelled / Expired| ABORT_DEL["Abort Operation + Retain Data"]
+    CONFIRM_DEL -->|"Cancelled / Expired"| ABORT_DEL["Abort Operation + Retain Data"]
 
-    ROUTE -->|List / View Reports| READ_REP["ReportService.get_user_reports()<br/>(Strict author_id Filter)"]
+    ROUTE -->|"List / View Reports"| READ_REP["ReportService.get_user_reports()<br/>(Strict author_id Filter)"]
 
     ROUTE -->|Analytical Query| AST_VAL{"SQLPolicyEngine (SQLGlot AST)<br/>1. Single SELECT Only<br/>2. Allowlisted Tables Only<br/>3. Block PII & direct orders.gender<br/>4. Rewrite Brand CTE Isolation<br/>5. Inject HAVING COUNT(DISTINCT user_id) >= k"}
 
-    AST_VAL -->|Hard Violation (PII / Brand / DML)| FAILS_FAST["0 Retries: Fail Fast + Audit Security Violation"]
-    AST_VAL -->|Soft Format Failure (e.g. SELECT *)| SOFT_RETRY{"Soft Repair Attempt <= 1?"}
+    AST_VAL -->|"Hard Violation (PII / Brand / DML)"| FAILS_FAST["0 Retries: Fail Fast + Audit Security Violation"]
+    AST_VAL -->|"Soft Format Failure (e.g. SELECT *)"| SOFT_RETRY{"Soft Repair Attempt <= 1?"}
     SOFT_RETRY -->|Yes| LLM_PLAN
     SOFT_RETRY -->|No| REJECT_SOFT["Reject Query with Formatting Error"]
 
@@ -201,8 +201,8 @@ flowchart TD
     RETRY_SYN -->|No| GRACEFUL_ERR["Graceful Error Message"]
 
     BQ_EXEC -->|0 Rows Returned| RETRY_EMPTY{"Empty Repair Attempt <= 1?"}
-    RETRY_EMPTY -->|Yes: Widen Casing / Date Filter| LLM_PLAN
-    RETRY_EMPTY -->|No: Still 0 Rows| CLARIFY["Return Explanation + Ask Clarifying Question"]
+    RETRY_EMPTY -->|"Yes: Widen Casing / Date Filter"| LLM_PLAN
+    RETRY_EMPTY -->|"No: Still 0 Rows"| CLARIFY["Return Explanation + Ask Clarifying Question"]
 
     BQ_EXEC -->|Data Returned| POST_GUARD{"PostSQLDataGuard (Pandas)<br/>Verify Demographic Aggregates >= k"}
     POST_GUARD -->|Mask Below k| MASK_DF["Mask Rows Below k Threshold"]
@@ -460,7 +460,6 @@ flowchart TD
 
 #### Reference Evaluation Set (5 Core Capability Categories)
 
-```markdown:Eval Set Example:docs/eval_set_example.md
 | ID | Capability Category | Test Query | Expected SQL Pattern / Behavior | Success Criterion |
 | :--- | :--- | :--- | :--- | :--- |
 | **EV-01** | **Customer Behavior** | "Who are our top spending customers in California?" | AST injects `__allowed_products` / `__scoped_*` CTEs. Selects `user_id`, `SUM(sale_price)`. Aggregates state with `HAVING COUNT(DISTINCT user_id) >= 5`. | Raw PII columns blocked. Returns HMAC pseudonyms. Data matches BQ ground truth. |
@@ -468,7 +467,6 @@ flowchart TD
 | **EV-03** | **Time-based Metrics** | "What was our monthly churn rate for the last 6 months?" | Applies `SemanticGlossary` default (no purchase in 90 days, status='Complete'). Calculates monthly churn ratio. | Response includes mandatory "Applied Metric Definitions" footer detailing 90-day formula. |
 | **EV-04** | **Database Structure** | "What data do we have available about customer logistics?" | Routing identifies intent as `db_schema`. Returns allowlisted schema descriptions without executing BQ query. | 0 BQ bytes billed. Explains available order tracking timestamps gracefully. |
 | **EV-05** | **Multi-step Query / Report** | "Create a Q1 performance report with action items for Q2." | Multi-turn analysis executing sales, top products, and churn queries. Synthesizes executive summary + action items. | Latency $p95 \le 120\text{s}$. Completes within budget ($\le 5$ LLM calls). |
-```
 
 ---
 
