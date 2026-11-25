@@ -36,6 +36,8 @@ class ChatUseCasePort(Protocol):
 class ReportManagementPort(Protocol):
     async def list_user_reports(self, user: UserContext) -> list[SavedReport]: ...
 
+    async def get_user_report(self, user: UserContext, report_id: str) -> SavedReport | None: ...
+
     async def save_report(self, report: SavedReport) -> SavedReport: ...
 
     async def prepare_deletion(
@@ -98,11 +100,19 @@ class ReportRepositoryPort(Protocol):
 
     async def list_by_owner(self, owner_user_id: str) -> list[SavedReport]: ...
 
+    async def get_by_id(self, owner_user_id: str, report_id: str) -> SavedReport | None: ...
+
     async def find_by_session(self, owner_user_id: str, session_id: str) -> list[SavedReport]: ...
 
     async def find_by_keyword(self, owner_user_id: str, keyword: str) -> list[SavedReport]: ...
 
-    async def delete_by_ids(self, owner_user_id: str, report_ids: list[str]) -> int: ...
+    async def delete_by_ids(
+        self,
+        owner_user_id: str,
+        report_ids: list[str],
+        *,
+        require_exact_match: bool = False,
+    ) -> int: ...
 
 
 class ConfirmationStorePort(Protocol):

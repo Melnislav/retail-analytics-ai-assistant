@@ -82,6 +82,21 @@ async def list_reports(
     return await report_service.list_user_reports(user)
 
 
+@router.get("/reports/{report_id}", response_model=SavedReport)
+async def get_report(
+    report_id: str,
+    user: UserContext = Depends(get_current_user),
+    report_service: ReportService = Depends(get_report_service),
+) -> SavedReport:
+    report = await report_service.get_user_report(user, report_id)
+    if report is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report not found.",
+        )
+    return report
+
+
 @router.get("/metrics")
 async def get_metrics(
     obs: ObservabilityPort = Depends(get_observability),

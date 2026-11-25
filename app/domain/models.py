@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
@@ -173,6 +174,7 @@ class SavedReport(BaseModel):
     report_id: str = Field(default_factory=lambda: str(uuid4()))
     owner_user_id: str
     session_id: str
+    question: str = ""
     title: str
     summary: str
     content_markdown: str
@@ -196,7 +198,17 @@ class PendingConfirmation(BaseModel):
     description: str
     target_report_ids: list[str]
     target_report_titles: list[str]
+    target_report_created_at: list[str] = Field(default_factory=list)
+    nonce: str = Field(default_factory=lambda: uuid4().hex[:16])
+    payload_hash: str = ""
     created_at: datetime = Field(default_factory=utc_now)
+    expires_at: datetime | None = None
+
+    @staticmethod
+    def compute_payload_hash(report_ids: list[str], user_id: str, nonce: str) -> str:
+        """Compute canonical SHA-256 snapshot hash binding target IDs, owner, and nonce."""
+        canonical = f"{'|'.join(sorted(set(report_ids)))}|{user_id}|{nonce}"
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class ChatMessage(BaseModel):

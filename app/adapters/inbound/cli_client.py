@@ -74,7 +74,7 @@ class RetailAssistantCLI:
                 f"User: [green]{self.user_name}[/green] (`{self.user_id}`, role=`{self.user_role}`)\n"
                 f"Session: [yellow]{self.session_id}[/yellow] | Mode: [magenta]{mode_str}[/magenta]\n"
                 "Commands: [bold]/help[/bold], [bold]/users[/bold], [bold]/user <id>[/bold], [bold]/clear[/bold], "
-                "[bold]/reports[/bold], [bold]/save <question>[/bold], [bold]/exit[/bold]",
+                "[bold]/reports[/bold], [bold]/report <id>[/bold], [bold]/save <question>[/bold], [bold]/exit[/bold]",
                 border_style="cyan",
             )
         )
@@ -100,6 +100,7 @@ class RetailAssistantCLI:
                 "• [bold]/user <name>[/bold] - Switch persona (e.g. /user ceo or /user alice)\n"
                 "• [bold]/clear[/bold] - Reset session conversation memory\n"
                 "• [bold]/reports[/bold] - List your saved reports\n"
+                "• [bold]/report <id>[/bold] - View a full saved report (question, SQL, and answer)\n"
                 "• [bold]/save <query>[/bold] - Ask question and save executive report\n"
                 "• [bold]/exit[/bold] - Exit CLI",
                 title="[bold green]Retail Assistant Help & Sample Queries[/bold green]",
@@ -207,7 +208,7 @@ class RetailAssistantCLI:
     async def _list_reports(self, client: httpx.AsyncClient | None) -> None:
         reports_list: list[dict[str, Any]] = []
         if self.standalone and self.container:
-            reports = await self.container.report_repo.list_by_owner(self.user_id)
+            reports = await self.container.report_service.list_user_reports(self.user_context)
             reports_list = [r.model_dump() for r in reports]
         elif client:
             try:
@@ -234,6 +235,59 @@ class RetailAssistantCLI:
                 str(r["report_id"])[:8], str(r.get("title", "")), str(r.get("created_at", ""))
             )
         console.print(tbl)
+        console.print("[dim]Tip: run /report <id> to inspect question, SQL, and answer.[/dim]")
+
+    async def _view_report(self, client: httpx.AsyncClient | None, report_id: str) -> None:
+        normalized_id = report_id.strip()
+        if not normalized_id:
+            console.print("[yellow]Usage: /report <id>[/yellow]")
+            return
+
+        report_data: dict[str, Any] | None = None
+        if self.standalone and self.container:
+            report = await self.container.report_service.get_user_report(
+                self.user_context, normalized_id
+            )
+            report_data = report.model_dump(mode="json") if report else None
+        elif client:
+            try:
+                resp = await client.get(
+                    f"{self.base_url}/api/v1/reports/{normalized_id}",
+                    headers=self.headers,
+                )
+                if resp.status_code == 200:
+                    report_data = resp.json()
+                elif resp.status_code == 404:
+                    report_data = None
+                else:
+                    console.print(f"[red]Error {resp.status_code}: {resp.text}[/red]")
+                    return
+            except Exception as exc:
+                console.print(f"[bold red]Error fetching report:[/bold red] {exc}")
+                return
+
+        if not report_data:
+            console.print(
+                f"[yellow]Report '{normalized_id}' not found for user '{self.user_id}'.[/yellow]"
+            )
+            return
+
+        question = report_data.get("question") or "(not recorded)"
+        sql_used = report_data.get("sql_used") or "(none)"
+        header_md = (
+            f"**ID:** `{report_data['report_id']}`  \n"
+            f"**Created:** {report_data.get('created_at', '')}  \n"
+            f"**Question:** {question}\n\n"
+            f"**SQL:**\n```sql\n{sql_used}\n```\n\n"
+            f"---\n\n{report_data.get('content_markdown', '')}"
+        )
+        console.print(
+            Panel(
+                Markdown(header_md),
+                title=f"Saved Report: {report_data.get('title', 'Untitled')}",
+                border_style="cyan",
+            )
+        )
 
     async def run(self) -> None:
         if self.standalone:
@@ -316,6 +370,15 @@ class RetailAssistantCLI:
                     await self._list_reports(client_ctx)
                     continue
 
+                if text.lower() == "/report":
+                    console.print("[yellow]Usage: /report <id>[/yellow]")
+                    continue
+
+                if text.lower().startswith("/report "):
+                    target_id = text.split(maxsplit=1)[1].strip()
+                    await self._view_report(client_ctx, target_id)
+                    continue
+
                 if text.lower().startswith("/role "):
                     console.print(
                         "[yellow]Role overrides are disabled. Use /users then /user <profile> "
@@ -343,9 +406,14 @@ class RetailAssistantCLI:
 
                 pending = data.get("pending_confirmation")
                 if pending:
+                    hash_hint = (
+                        f" [hash: {pending['payload_hash'][:12]}]"
+                        if pending.get("payload_hash")
+                        else ""
+                    )
                     approved = await asyncio.to_thread(
                         Confirm.ask,
-                        f"[bold red]Confirm permanent deletion of {len(pending['target_report_ids'])} report(s)?[/bold red]",
+                        f"[bold red]Confirm permanent deletion of {len(pending['target_report_ids'])} report(s){hash_hint}?[/bold red]",
                         default=False,
                     )
                     conf_data = await self._confirm_action(client_ctx, pending["token"], approved)

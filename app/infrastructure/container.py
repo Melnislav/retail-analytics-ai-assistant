@@ -90,6 +90,7 @@ class ApplicationContainer:
             repo=self.report_repo,
             confirmation_store=self.redis_adapter,
             observability=self.observability,
+            confirmation_ttl_seconds=settings.confirmation_ttl_seconds,
         )
         self.chat_orchestrator = ChatOrchestratorService(
             llm_agent=self.llm_agent,

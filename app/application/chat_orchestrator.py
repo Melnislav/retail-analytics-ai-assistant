@@ -19,7 +19,11 @@ from app.application.ports import (
     ObservabilityPort,
 )
 from app.application.report_service import ReportService
-from app.domain.exceptions import QueryExecutionError, SQLSafetyError
+from app.domain.exceptions import (
+    ConfirmationValidationError,
+    QueryExecutionError,
+    SQLSafetyError,
+)
 from app.domain.input_safety import InputSafetyPolicy
 from app.domain.models import (
     AnalystSynthesis,
@@ -317,10 +321,24 @@ class ChatOrchestratorService:
                 reply=reply,
             )
 
-        deleted_count = await self._reports.execute_confirmed_deletion(pending, user)
+        try:
+            deleted_count = await self._reports.execute_confirmed_deletion(pending, user)
+        except ConfirmationValidationError as exc:
+            self._obs.increment_metric("destructive_confirmations_rejected")
+            reply = self._mask_text(exc.message)
+            await self._cache.append_chat_message(
+                request.session_id, ChatMessage(role="assistant", content=reply)
+            )
+            return ChatResponse(
+                session_id=request.session_id,
+                trace_id=trace_id,
+                reply=reply,
+            )
+
+        short_ids = ", ".join(f"`{rid[:8]}`" for rid in pending.target_report_ids)
         titles_str = ", ".join(f"'{t}'" for t in pending.target_report_titles)
         reply = self._mask_text(
-            f"Confirmed and executed: deleted {deleted_count} report(s) ({titles_str})."
+            f"Confirmed and executed: deleted {deleted_count} report(s) [{short_ids}] ({titles_str})."
         )
         await self._cache.append_chat_message(
             request.session_id, ChatMessage(role="assistant", content=reply)
@@ -431,11 +449,27 @@ class ChatOrchestratorService:
                     ],
                 }
             )
-            titles_bullets = "\n".join(f"- {t}" for t in safe_pending.target_report_titles)
+            bullet_lines: list[str] = []
+            for idx, title in enumerate(safe_pending.target_report_titles):
+                rid = (
+                    safe_pending.target_report_ids[idx][:8]
+                    if idx < len(safe_pending.target_report_ids)
+                    else "unknown"
+                )
+                created = (
+                    safe_pending.target_report_created_at[idx]
+                    if idx < len(safe_pending.target_report_created_at)
+                    else ""
+                )
+                created_suffix = f" ({created})" if created else ""
+                bullet_lines.append(f"- `{rid}` — **{title}**{created_suffix}")
+            titles_bullets = "\n".join(bullet_lines)
+            hash_preview = safe_pending.payload_hash[:12] if safe_pending.payload_hash else "n/a"
             reply = (
                 f"**Confirmation Required (Destructive Action)**\n"
                 f"{safe_pending.description}\n\n"
                 f"Matched reports:\n{titles_bullets}\n\n"
+                f"Snapshot hash: `{hash_preview}`\n"
                 f"Please confirm using token `{safe_pending.token}` (or approve in the prompt) before I permanently delete them."
             )
             await self._cache.append_chat_message(
@@ -546,6 +580,7 @@ class ChatOrchestratorService:
                 SavedReport(
                     owner_user_id=user.user_id,
                     session_id=request.session_id,
+                    question=safe_message,
                     title=report_title,
                     summary=self._masker.mask_text(synthesis.executive_summary)[0],
                     content_markdown=masked_reply,

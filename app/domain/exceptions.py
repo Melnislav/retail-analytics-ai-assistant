@@ -49,6 +49,13 @@ class ConfirmationRequiredError(DomainError):
         self.token = token
 
 
+class ConfirmationValidationError(DomainError):
+    """Raised when a destructive confirmation fails owner, expiry, hash, or TOCTOU checks."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="CONFIRMATION_VALIDATION_FAILED")
+
+
 class ExternalServiceUnavailableError(DomainError):
     """Raised when an external dependency (LLM, BigQuery) trips its circuit breaker."""
 
