@@ -16,7 +16,11 @@ from app.domain.post_sql_guard import PostSQLDataGuard
 from app.domain.privacy_policy import PrivacyPolicy
 from app.domain.semantic_glossary import SemanticGlossary
 from app.domain.sql_policy import SQLPolicyEngine
-from app.infrastructure.config import Settings, resolve_local_user_context
+from app.infrastructure.config import (
+    Settings,
+    load_business_glossary,
+    resolve_local_user_context,
+)
 
 
 class ApplicationContainer:
@@ -50,8 +54,12 @@ class ApplicationContainer:
         self.report_repo = PostgresReportRepository(self.db_manager.session_factory)
 
         # Domain Policies & Semantic Glossary
+        merged_glossary = {
+            **load_business_glossary(),
+            **settings.custom_metric_glossary,
+        }
         self.glossary = SemanticGlossary(
-            custom_definitions=settings.custom_metric_glossary,
+            custom_definitions=merged_glossary,
             enabled=settings.enable_semantic_glossary,
             clarification_messages=settings.metric_clarification_messages,
         )

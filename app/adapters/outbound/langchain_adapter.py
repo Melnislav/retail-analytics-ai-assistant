@@ -26,7 +26,7 @@ from app.domain.models import (
     UserPreferenceProfile,
 )
 from app.domain.pii_masker import PIIMasker
-from app.domain.semantic_glossary import SemanticGlossary
+from app.domain.semantic_glossary import SemanticGlossary, get_active_glossary
 
 logger = logging.getLogger(__name__)
 
@@ -402,8 +402,9 @@ class LangChainRetailAgentAdapter:
         previous_error: str | None = None,
         previous_sql: str | None = None,
     ) -> SQLPlan:
+        glossary = get_active_glossary(self._glossary)
         retry_context = ""
-        if self._glossary.has_unsupported_configured_churn_scope(user_message):
+        if glossary.has_unsupported_configured_churn_scope(user_message):
             return self._clarification_plan("unsupported_configured_churn_scope")
         if previous_error:
             retry_context = (
@@ -411,7 +412,7 @@ class LangChainRetailAgentAdapter:
                 "Fix the SQL query carefully so it executes cleanly on BigQuery StandardSQL."
             )
 
-        glossary_rules = self._glossary.format_system_prompt_section()
+        glossary_rules = glossary.format_system_prompt_section()
         system_prompt = (
             "You are a Principal Retail Data Analyst generating BigQuery StandardSQL.\n"
             f"Available Schema:\n{schema_summary}\n\n"
@@ -436,7 +437,7 @@ class LangChainRetailAgentAdapter:
         plan = await self._invoke_with_resilience(SQLPlan, messages, "generate_sql_plan")
         applied_defs = [
             f"{m.name}: {m.description} (Formula: {m.sql_formula})"
-            for m in self._glossary.detect_metrics(user_message)
+            for m in glossary.detect_metrics(user_message)
         ]
         if plan is not None:
             if not plan.applied_metric_definitions:
@@ -446,12 +447,13 @@ class LangChainRetailAgentAdapter:
         return fallback_plan.model_copy(update={"applied_metric_definitions": applied_defs})
 
     def _heuristic_sql_plan(self, user_message: str) -> SQLPlan:
+        glossary = get_active_glossary(self._glossary)
         low = user_message.lower()
         has_churn = "churn" in low or "отток" in low
         has_returns = any(word in low for word in ("return", "cancel", "возврат", "отмен"))
-        if self._glossary.has_unsupported_cancelled_order_churn_override(user_message):
+        if glossary.has_unsupported_cancelled_order_churn_override(user_message):
             return self._clarification_plan("unsupported_cancelled_order_churn_override")
-        if self._glossary.has_unsupported_configured_churn_scope(user_message):
+        if glossary.has_unsupported_configured_churn_scope(user_message):
             return self._clarification_plan("unsupported_configured_churn_scope")
         if "schema" in low or "what tables" in low or "what data is available" in low:
             return SQLPlan(
@@ -470,7 +472,7 @@ class LangChainRetailAgentAdapter:
                 f"ORDER BY avg_spend_usd DESC LIMIT 20"
             )
         elif has_churn and ("return" in low or "возврат" in low):
-            churn_days = self._glossary.churn_inactivity_days(user_message)
+            churn_days = glossary.churn_inactivity_days(user_message)
             sql = (
                 f"WITH customer_activity AS (\n"
                 f"  SELECT user_id, MAX(created_at) AS last_order_at\n"
@@ -503,7 +505,7 @@ class LangChainRetailAgentAdapter:
         elif "aov" in low or "average order value" in low or "basket size" in low:
             status_filter = (
                 "status != 'Cancelled'"
-                if self._glossary.aov_includes_returns(user_message)
+                if glossary.aov_includes_returns(user_message)
                 else "status = 'Complete'"
             )
             sql = (
@@ -512,7 +514,7 @@ class LangChainRetailAgentAdapter:
                 f"WHERE {status_filter}"
             )
         elif has_churn:
-            churn_days = self._glossary.churn_inactivity_days(user_message)
+            churn_days = glossary.churn_inactivity_days(user_message)
             sql = (
                 f"WITH customer_activity AS (\n"
                 f"  SELECT user_id, MAX(created_at) AS last_order_at\n"
@@ -526,7 +528,7 @@ class LangChainRetailAgentAdapter:
                 f"  ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN last_order_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {churn_days} DAY) THEN user_id END), COUNT(DISTINCT user_id)) * 100, 2) AS churn_rate_pct\n"
                 f"FROM customer_activity"
             )
-        elif self._glossary.revenue_includes_returns(user_message):
+        elif glossary.revenue_includes_returns(user_message):
             sql = (
                 f"SELECT p.category, p.department, COUNT(DISTINCT oi.order_id) AS orders_count, "
                 f"ROUND(SUM(oi.sale_price), 2) AS revenue_usd "
@@ -556,7 +558,7 @@ class LangChainRetailAgentAdapter:
                 f"GROUP BY p.category ORDER BY net_revenue_usd DESC LIMIT 20"
             )
         elif "repeat" in low or "повторн" in low:
-            min_orders = self._glossary.repeat_customer_min_orders(user_message)
+            min_orders = glossary.repeat_customer_min_orders(user_message)
 
             sql = (
                 f"WITH scoped_orders AS (\n"
@@ -609,11 +611,12 @@ class LangChainRetailAgentAdapter:
 
     def _clarification_plan(self, message_key: str) -> SQLPlan:
         """Build a no-query response for a metric rule the application cannot apply safely."""
+        glossary = get_active_glossary(self._glossary)
         return SQLPlan(
             reasoning="The requested metric definition cannot be applied safely.",
             sql_query="",
             requires_sql=False,
-            response_message=self._glossary.clarification_message(message_key),
+            response_message=glossary.clarification_message(message_key),
         )
 
     async def synthesize_response(
@@ -624,10 +627,11 @@ class LangChainRetailAgentAdapter:
         preferences: UserPreferenceProfile,
         history: list[ChatMessage],
     ) -> AnalystSynthesis:
+        glossary = get_active_glossary(self._glossary)
         rows_preview = query_result.rows[:30] if query_result else []
         sql_used = query_result.sql_executed if query_result else "N/A (Metadata response)"
 
-        matched_metrics = self._glossary.detect_metrics(
+        matched_metrics = glossary.detect_metrics(
             user_message + " " + (query_result.sql_executed if query_result else "")
         )
         applied_defs = (
@@ -636,7 +640,7 @@ class LangChainRetailAgentAdapter:
             else [f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in matched_metrics]
         )
         glossary_hint = (
-            f"\nRelevant Metric Definitions:\n{self._glossary.format_response_definitions(matched_metrics)}\n"
+            f"\nRelevant Metric Definitions:\n{glossary.format_response_definitions(matched_metrics)}\n"
             if matched_metrics
             else ""
         )
@@ -687,7 +691,8 @@ class LangChainRetailAgentAdapter:
         persona: PersonaConfig,
         preferences: UserPreferenceProfile,
     ) -> AnalystSynthesis:
-        matched_metrics = self._glossary.detect_metrics(
+        glossary = get_active_glossary(self._glossary)
+        matched_metrics = glossary.detect_metrics(
             user_message + " " + (query_result.sql_executed if query_result else "")
         )
         used_defs = (
@@ -696,7 +701,7 @@ class LangChainRetailAgentAdapter:
             else [f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in matched_metrics]
         )
         glossary_section = (
-            "\n\n" + self._glossary.format_response_definitions(matched_metrics)
+            "\n\n" + glossary.format_response_definitions(matched_metrics)
             if matched_metrics
             else ""
         )

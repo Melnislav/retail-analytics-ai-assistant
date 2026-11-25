@@ -72,6 +72,22 @@ def resolve_local_user_context(
         raise ValueError(f"Invalid local RBAC profile: {profile_key}") from exc
 
 
+def load_business_glossary(
+    config_path: str | Path = "configs/business_glossary.yaml",
+) -> dict[str, Any]:
+    """Load default business metric definitions from YAML configuration."""
+    path = Path(config_path)
+    if path.is_file():
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+                if isinstance(data, dict) and isinstance(data.get("metrics"), dict):
+                    return dict(data["metrics"])
+        except Exception:
+            pass
+    return {}
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",

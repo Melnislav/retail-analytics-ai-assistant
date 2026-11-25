@@ -45,7 +45,11 @@ from app.domain.models import (
 )
 from app.domain.pii_masker import PIIMasker
 from app.domain.post_sql_guard import PostSQLDataGuard
-from app.domain.semantic_glossary import SemanticGlossary
+from app.domain.semantic_glossary import (
+    SemanticGlossary,
+    SessionGlossaryOverrides,
+    session_glossary_scope,
+)
 from app.domain.sql_policy import SQLPolicyEngine
 
 logger = logging.getLogger(__name__)
@@ -622,6 +626,38 @@ class ChatOrchestratorService:
                             observability={"trace_id": trace_id, **budget.to_dict()},
                         )
 
+                    # Session-level semantic glossary overrides (validated 1..365 days for churn)
+                    glossary_cache_key = f"glossary_overrides:{request.session_id}"
+                    raw_overrides = await self._cache.get_json(glossary_cache_key)
+                    session_overrides = (
+                        SessionGlossaryOverrides.model_validate(raw_overrides)
+                        if isinstance(raw_overrides, dict)
+                        else SessionGlossaryOverrides()
+                    )
+                    new_overrides, glossary_err = self._glossary.extract_session_overrides(
+                        safe_message
+                    )
+                    if glossary_err is not None:
+                        trace_meta["final_reply"] = glossary_err
+                        await self._cache.append_chat_message(
+                            request.session_id,
+                            ChatMessage(role="assistant", content=glossary_err),
+                        )
+                        return ChatResponse(
+                            session_id=request.session_id,
+                            trace_id=trace_id,
+                            reply=glossary_err,
+                            observability={"trace_id": trace_id, **budget.to_dict()},
+                        )
+                    if not new_overrides.is_empty():
+                        session_overrides = session_overrides.merge(new_overrides)
+                        await self._cache.set_json(
+                            glossary_cache_key,
+                            session_overrides.model_dump(),
+                            ttl_seconds=86400,
+                        )
+                    active_glossary = self._glossary.with_session_overrides(session_overrides)
+
                     # Golden knowledge retrieval and dynamic persona storage are design-only in this prototype.
                     t_ret = time.perf_counter()
                     schema_summary = await self._warehouse.get_all_schemas_summary()
@@ -632,22 +668,23 @@ class ChatOrchestratorService:
                     )
 
                     # 6. LangGraph Workflow (SQL Generation + Safety Validation + Differentiated Retry + Executive Synthesis)
-                    workflow_state = await self._analysis_graph.ainvoke(
-                        {
-                            "user_message": safe_message,
-                            "user_context": user,
-                            "history": history,
-                            "schema_summary": schema_summary,
-                            "preferences": prefs,
-                            "trace_id": trace_id,
-                            "attempt": 1,
-                            "soft_retries": 0,
-                            "syntax_retries": 0,
-                            "empty_retries": 0,
-                            "budget": budget,
-                            "trace_meta": trace_meta,
-                        }
-                    )
+                    with session_glossary_scope(active_glossary):
+                        workflow_state = await self._analysis_graph.ainvoke(
+                            {
+                                "user_message": safe_message,
+                                "user_context": user,
+                                "history": history,
+                                "schema_summary": schema_summary,
+                                "preferences": prefs,
+                                "trace_id": trace_id,
+                                "attempt": 1,
+                                "soft_retries": 0,
+                                "syntax_retries": 0,
+                                "empty_retries": 0,
+                                "budget": budget,
+                                "trace_meta": trace_meta,
+                            }
+                        )
 
                     fatal = workflow_state.get("fatal_error")
                     if isinstance(fatal, QueryBudgetExceededError):
@@ -715,7 +752,7 @@ class ChatOrchestratorService:
             ):
                 used_metrics_list = list(query_result.applied_metric_definitions)
             if not has_clarification and not used_metrics_list:
-                detected = self._glossary.detect_metrics(
+                detected = active_glossary.detect_metrics(
                     safe_message + " " + (query_result.sql_executed if query_result else "")
                 )
                 used_metrics_list = [
@@ -723,10 +760,10 @@ class ChatOrchestratorService:
                 ]
             combined_md = f"{synthesis.executive_summary}\n\n{synthesis.detailed_analysis}"
             if used_metrics_list and "Metric Definitions Applied" not in combined_md:
-                detected_metrics = self._glossary.detect_metrics(
+                detected_metrics = active_glossary.detect_metrics(
                     safe_message + " " + (query_result.sql_executed if query_result else "")
                 )
-                defs_block = self._glossary.format_response_definitions(detected_metrics or None)
+                defs_block = active_glossary.format_response_definitions(detected_metrics or None)
                 if defs_block:
                     combined_md += f"\n\n{defs_block}"
 
