@@ -1,4 +1,4 @@
-"""Unit and integration tests for Step 1: PrivacyPolicy, PIIMasker, SQLPolicyEngine, PostSQLDataGuard."""
+"""Interface and E2E tests for SQLPolicyEngine, PostSQLDataGuard, and orchestrator guards."""
 
 from __future__ import annotations
 
@@ -18,55 +18,11 @@ from app.domain.models import (
     UserContext,
     UserRole,
 )
-from app.domain.pii_masker import (
-    PSEUDONYMIZED_ID_COLUMNS,
-    SENSITIVE_COLUMN_NAMES,
-    PIIMasker,
-)
 from app.domain.post_sql_guard import PostSQLDataGuard
-from app.domain.privacy_policy import DEFAULT_PRIVACY_POLICY, PrivacyPolicy
-from app.domain.sql_policy import DEMOGRAPHIC_COLUMNS, FORBIDDEN_PII_COLUMNS, SQLPolicyEngine
+from app.domain.privacy_policy import PrivacyPolicy
+from app.domain.sql_policy import SQLPolicyEngine
 from app.infrastructure.config import Settings
 from app.infrastructure.container import ApplicationContainer
-
-
-def test_privacy_policy_is_shared_and_does_not_mask_product_name() -> None:
-    policy = PrivacyPolicy(demographic_min_group_size=6)
-    masker = PIIMasker(salt="salt-a", policy=policy)
-    sql_policy = SQLPolicyEngine(privacy_policy=policy)
-
-    assert DEFAULT_PRIVACY_POLICY.pii_columns == SENSITIVE_COLUMN_NAMES
-    assert DEFAULT_PRIVACY_POLICY.pii_columns == FORBIDDEN_PII_COLUMNS
-    assert DEFAULT_PRIVACY_POLICY.demographic_columns == DEMOGRAPHIC_COLUMNS
-    assert DEFAULT_PRIVACY_POLICY.user_identifier_columns == PSEUDONYMIZED_ID_COLUMNS
-    assert sql_policy._demographic_min_group_size == 6
-
-    rows = [
-        {"name": "Calvin Klein Jeans", "revenue": 100.0},
-        {"name": "Promo item jane.doe@example.com", "revenue": 50.0},
-    ]
-    masked_rows, redactions = masker.mask_rows(rows)
-
-    assert masked_rows[0]["name"] == "Calvin Klein Jeans"
-    assert masked_rows[1]["name"] == "Promo item [REDACTED_EMAIL]"
-    assert redactions == 1
-
-
-def test_pii_masker_uses_keyed_hmac_sha256_pseudonym() -> None:
-    masker_a1 = PIIMasker(salt="salt-one")
-    masker_a2 = PIIMasker(salt="salt-one")
-    masker_b = PIIMasker(salt="salt-two")
-
-    pseudo_a1 = masker_a1.pseudonymize_id(42)
-    pseudo_a2 = masker_a2.pseudonymize_id(42)
-    pseudo_b = masker_b.pseudonymize_id(42)
-
-    assert pseudo_a1 == pseudo_a2
-    assert pseudo_a1 != pseudo_b
-    assert pseudo_a1.startswith("CUST_")
-    suffix = pseudo_a1.removeprefix("CUST_")
-    assert len(suffix) == 12
-    assert all(ch in "0123456789ABCDEF" for ch in suffix)
 
 
 def test_sql_policy_rewrites_scoped_orders_num_of_item_for_brand_manager() -> None:
@@ -156,38 +112,6 @@ def test_sql_policy_treats_subquery_user_demo_projection_as_soft_when_outer_is_a
     assert outer_leak.severity == "hard"
 
 
-@pytest.mark.asyncio
-async def test_sql_prompt_guides_single_level_explicit_demographic_group_by() -> None:
-    from unittest.mock import MagicMock
-
-    from langchain_core.messages import BaseMessage
-    from langchain_core.runnables import RunnableLambda
-
-    from app.adapters.outbound.langchain_adapter import LangChainRetailAgentAdapter, LLMProvider
-
-    captured: list[BaseMessage] = []
-
-    async def capture(messages: list[BaseMessage]) -> SQLPlan:
-        captured.extend(messages)
-        return SQLPlan(reasoning="ok", sql_query="SELECT 1", requires_sql=True)
-
-    mock_model = MagicMock()
-    mock_model.with_structured_output.return_value = RunnableLambda(capture)
-    adapter = LangChainRetailAgentAdapter()
-    adapter._providers = [LLMProvider(name="test", model=mock_model)]
-
-    await adapter.generate_sql_plan(
-        user_message="Compare average customer spend by state",
-        schema_summary="users, order_items",
-        user_context=UserContext(user_id="ceo", role=UserRole.CEO),
-        history=[],
-    )
-    prompt_text = "\n".join(str(m.content) for m in captured)
-    assert "GROUP BY u.<column>" in prompt_text
-    assert "never positional" in prompt_text
-    assert "single SELECT" in prompt_text
-
-
 def test_post_sql_data_guard_enforces_k_anonymity_and_strips_linked_demographics() -> None:
     guard = PostSQLDataGuard(PrivacyPolicy(demographic_min_group_size=5))
 
@@ -226,6 +150,7 @@ async def test_orchestrator_records_pre_guard_span_and_applies_post_sql_guard(
         redis_url="redis://invalid-host-uses-memory-fallback:6379/0",
         bigquery_mock_mode=True,
         google_api_key="",
+        openrouter_api_key="",
         openai_api_key="",
     )
     container = ApplicationContainer(test_settings)

@@ -31,6 +31,7 @@ def _build_test_settings(tmp_path: Path, db_name: str, confirmation_ttl: int = 6
         redis_url="redis://invalid-host-uses-memory-fallback:6379/0",
         bigquery_mock_mode=True,
         google_api_key="",
+        openrouter_api_key="",
         openai_api_key="",
         confirmation_ttl_seconds=confirmation_ttl,
     )

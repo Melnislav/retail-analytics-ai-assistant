@@ -1,4 +1,4 @@
-"""Tests for LangChain-native provider fallback and CLI resilience."""
+"""Interface and E2E tests for resilience, provider fallback, budget guards, and CLI error handling."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from langchain_core.runnables import RunnableLambda
 from app.adapters.inbound.cli_client import RetailAssistantCLI
 from app.adapters.outbound.bigquery_adapter import BigQueryRunner
 from app.adapters.outbound.langchain_adapter import LangChainRetailAgentAdapter, LLMProvider
+from app.adapters.outbound.redis_and_telemetry import AsyncRedisAdapter
 from app.domain.budget import TurnBudget, turn_budget_scope
 from app.domain.exceptions import (
     ExternalServiceUnavailableError,
@@ -34,13 +35,12 @@ from app.domain.models import (
     UserContext,
     UserRole,
 )
-from app.domain.sql_policy import SQLPolicyEngine
 from app.infrastructure.config import Settings
 from app.infrastructure.container import ApplicationContainer
 
 
 @pytest.mark.asyncio
-async def test_langchain_native_fallback_uses_second_provider() -> None:
+async def test_langchain_native_fallback_uses_second_provider_and_marks_budget() -> None:
     adapter = LangChainRetailAgentAdapter()
     calls: list[str] = []
 
@@ -63,38 +63,12 @@ async def test_langchain_native_fallback_uses_second_provider() -> None:
         LLMProvider(name="fallback", model=fallback),
     ]
 
-    decision = await adapter.classify_and_guard("Show revenue by brand", [])
-
-    assert decision == expected
-    assert calls == ["primary", "fallback"]
-
-
-@pytest.mark.asyncio
-async def test_langchain_native_fallback_marks_budget_fallback_used() -> None:
-    adapter = LangChainRetailAgentAdapter()
-
-    async def fail_primary(_messages: object) -> GuardrailDecision:
-        raise RuntimeError("primary unavailable")
-
-    expected = GuardrailDecision(intent=IntentType.DATA_ANALYSIS, is_safe=True)
-
-    async def use_fallback(_messages: object) -> GuardrailDecision:
-        return expected
-
-    primary = MagicMock()
-    primary.with_structured_output.return_value = RunnableLambda(fail_primary)
-    fallback = MagicMock()
-    fallback.with_structured_output.return_value = RunnableLambda(use_fallback)
-    adapter._providers = [
-        LLMProvider(name="primary", model=primary),
-        LLMProvider(name="fallback", model=fallback),
-    ]
-
     budget = TurnBudget(max_llm_calls=5, max_cost_usd=1.0)
     with turn_budget_scope(budget):
         decision = await adapter.classify_and_guard("Show revenue by brand", [])
 
     assert decision == expected
+    assert calls == ["primary", "fallback"]
     assert budget.fallback_used is True
 
     # Primary succeeding must NOT set fallback_used
@@ -114,7 +88,7 @@ async def test_langchain_native_fallback_marks_budget_fallback_used() -> None:
 
 
 @pytest.mark.asyncio
-async def test_langchain_all_failed_uses_heuristic() -> None:
+async def test_langchain_all_failed_heuristic_fail_closed_contract() -> None:
     adapter = LangChainRetailAgentAdapter()
 
     async def fail(_messages: object) -> GuardrailDecision:
@@ -124,63 +98,23 @@ async def test_langchain_all_failed_uses_heuristic() -> None:
     model.with_structured_output.return_value = RunnableLambda(fail)
     adapter._providers = [LLMProvider(name="primary", model=model)]
 
-    decision = await adapter.classify_and_guard("Tell me a joke", [])
+    off_topic = await adapter.classify_and_guard("Tell me a joke", [])
+    assert off_topic.intent == IntentType.BLOCKED_OFF_TOPIC
+    assert off_topic.is_safe is False
 
-    assert decision.intent == IntentType.BLOCKED_OFF_TOPIC
-    assert decision.is_safe is False
+    non_retail = await adapter.classify_and_guard("What is the capital of France?", [])
+    assert non_retail.intent == IntentType.BLOCKED_OFF_TOPIC
+    assert non_retail.is_safe is False
+    assert non_retail.rejection_reason is not None
 
+    retail = await adapter.classify_and_guard("What was revenue by brand last quarter?", [])
+    assert retail.intent == IntentType.DATA_ANALYSIS
+    assert retail.is_safe is True
 
-@pytest.mark.asyncio
-async def test_langchain_all_failed_fails_closed_for_non_retail_question() -> None:
-    adapter = LangChainRetailAgentAdapter()
-
-    async def fail(_messages: object) -> GuardrailDecision:
-        raise RuntimeError("total outage")
-
-    model = MagicMock()
-    model.with_structured_output.return_value = RunnableLambda(fail)
-    adapter._providers = [LLMProvider(name="primary", model=model)]
-
-    decision = await adapter.classify_and_guard("What is the capital of France?", [])
-
-    assert decision.intent == IntentType.BLOCKED_OFF_TOPIC
-    assert decision.is_safe is False
-    assert decision.rejection_reason is not None
-
-
-@pytest.mark.asyncio
-async def test_langchain_all_failed_allows_retail_question() -> None:
-    adapter = LangChainRetailAgentAdapter()
-
-    async def fail(_messages: object) -> GuardrailDecision:
-        raise RuntimeError("total outage")
-
-    model = MagicMock()
-    model.with_structured_output.return_value = RunnableLambda(fail)
-    adapter._providers = [LLMProvider(name="primary", model=model)]
-
-    decision = await adapter.classify_and_guard("What was revenue by brand last quarter?", [])
-
-    assert decision.intent == IntentType.DATA_ANALYSIS
-    assert decision.is_safe is True
-
-
-@pytest.mark.asyncio
-async def test_langchain_all_failed_allows_followup_with_history() -> None:
-    adapter = LangChainRetailAgentAdapter()
-
-    async def fail(_messages: object) -> GuardrailDecision:
-        raise RuntimeError("total outage")
-
-    model = MagicMock()
-    model.with_structured_output.return_value = RunnableLambda(fail)
-    adapter._providers = [LLMProvider(name="primary", model=model)]
     history = [ChatMessage(role="assistant", content="Revenue by brand is trending up.")]
-
-    decision = await adapter.classify_and_guard("and by region?", history)
-
-    assert decision.intent == IntentType.DATA_ANALYSIS
-    assert decision.is_safe is True
+    followup = await adapter.classify_and_guard("and by region?", history)
+    assert followup.intent == IntentType.DATA_ANALYSIS
+    assert followup.is_safe is True
 
 
 @pytest.mark.asyncio
@@ -203,45 +137,13 @@ async def test_cli_client_handles_timeout_gracefully(monkeypatch: pytest.MonkeyP
         pytest.fail("CLI crashed with unhandled httpx.TimeoutException")
 
 
-def test_default_gemini_model_is_2_5_flash(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("GEMINI_MODEL", raising=False)
-    assert Settings().gemini_model == "gemini-2.5-flash"
-    import inspect
-
-    sig = inspect.signature(LangChainRetailAgentAdapter.__init__)
-    assert sig.parameters["gemini_model"].default == "gemini-2.5-flash"
-
-
-def test_sql_policy_classifies_hard_and_soft_violations() -> None:
-    policy = SQLPolicyEngine(demographic_min_group_size=5)
-    ceo = UserContext(user_id="ceo_1", role=UserRole.CEO)
-
-    hard_dml = policy.validate_and_secure("DROP TABLE orders", ceo)
-    hard_pii = policy.validate_and_secure("SELECT email FROM users", ceo)
-    hard_link = policy.validate_and_secure(
-        "SELECT u.id, u.state FROM users u GROUP BY u.id, u.state HAVING COUNT(DISTINCT u.id) >= 5",
-        ceo,
-    )
-    soft_wildcard = policy.validate_and_secure("SELECT * FROM products", ceo)
-    soft_demographics = policy.validate_and_secure(
-        "SELECT u.state, COUNT(DISTINCT u.id) AS cnt FROM users u GROUP BY u.state",
-        ceo,
-    )
-
-    assert not hard_dml.is_valid and hard_dml.severity == "hard"
-    assert not hard_pii.is_valid and hard_pii.severity == "hard"
-    assert not hard_link.is_valid and hard_link.severity == "hard"
-    assert not soft_wildcard.is_valid and soft_wildcard.severity == "soft"
-    assert not soft_demographics.is_valid and soft_demographics.severity == "soft"
-
-
 def _resilience_test_settings(tmp_path: Path, db_name: str, **overrides: object) -> Settings:
     return Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/{db_name}",
         redis_url="redis://invalid-host-uses-memory-fallback:6379/0",
         bigquery_mock_mode=True,
         google_api_key="",
+        openrouter_api_key="",
         openai_api_key="",
         **overrides,  # type: ignore[arg-type]
     )
@@ -557,8 +459,6 @@ async def test_bigquery_infrastructure_errors_fail_fast_without_sql_retries(
 
 @pytest.mark.asyncio
 async def test_redis_adapter_trips_cooldown_after_connection_failure() -> None:
-    from app.adapters.outbound.redis_and_telemetry import AsyncRedisAdapter
-
     adapter = AsyncRedisAdapter(
         redis_url="redis://localhost:6379/0",
         failure_cooldown_seconds=60.0,

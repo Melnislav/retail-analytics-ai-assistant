@@ -22,6 +22,7 @@ def _obs_test_settings(tmp_path: Path, db_name: str = "obs.db") -> Settings:
         redis_url="redis://invalid-host-uses-memory-fallback:6379/0",
         bigquery_mock_mode=True,
         google_api_key="",
+        openrouter_api_key="",
         openai_api_key="",
         trace_log_path=str(tmp_path / "logs" / "agent_traces.jsonl"),
     )

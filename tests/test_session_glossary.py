@@ -1,4 +1,4 @@
-"""Tests for Step 5: Session-level glossary overrides, range validation, and YAML glossary loading."""
+"""E2E tests for session-level glossary overrides and range validation."""
 
 from __future__ import annotations
 
@@ -7,8 +7,7 @@ from pathlib import Path
 import pytest
 
 from app.domain.models import ChatRequest, UserContext, UserRole
-from app.domain.semantic_glossary import SemanticGlossary
-from app.infrastructure.config import Settings, load_business_glossary
+from app.infrastructure.config import Settings
 from app.infrastructure.container import ApplicationContainer
 
 
@@ -18,34 +17,10 @@ def _session_test_settings(tmp_path: Path) -> Settings:
         redis_url="redis://invalid-host-uses-memory-fallback:6379/0",
         bigquery_mock_mode=True,
         google_api_key="",
+        openrouter_api_key="",
         openai_api_key="",
         trace_log_path=str(tmp_path / "traces.jsonl"),
     )
-
-
-def test_load_business_glossary_yaml_and_fallback(tmp_path: Path) -> None:
-    loaded = load_business_glossary("configs/business_glossary.yaml")
-    assert "churn_rate" in loaded
-    assert "net_revenue" in loaded
-
-    missing = load_business_glossary(tmp_path / "missing.yaml")
-    assert missing == {}
-
-
-def test_extract_session_overrides_ignores_months_and_validates_bounds() -> None:
-    glossary = SemanticGlossary()
-
-    months_overrides, months_err = glossary.extract_session_overrides(
-        "What was our monthly churn rate for the last 6 months?"
-    )
-    assert months_err is None
-    assert months_overrides.churn_days is None
-
-    _, zero_err = glossary.extract_session_overrides("Define churn as no purchase in 0 days")
-    assert zero_err is not None and "1 and 365" in zero_err
-
-    _, high_err = glossary.extract_session_overrides("Calculate churn using 500 days")
-    assert high_err is not None and "1 and 365" in high_err
 
 
 @pytest.mark.asyncio
@@ -157,23 +132,16 @@ async def test_session_glossary_overrides_persist_within_session_without_global_
 async def test_churn_query_with_months_window_keeps_default_90_day_definition(
     tmp_path: Path,
 ) -> None:
-    glossary = SemanticGlossary()
-    query = "What was our monthly churn rate for the last 6 months?"
-    assert glossary.churn_inactivity_days(query) == 90
-
-    detected = glossary.detect_metrics(query)
-    churn_metric = next((m for m in detected if m.key == "churn_rate"), None)
-    assert churn_metric is not None
-    assert "last 90 days" in churn_metric.description
-    assert "User custom rule" not in churn_metric.description
-
     container = ApplicationContainer(_session_test_settings(tmp_path))
     await container.startup()
     ceo = UserContext(user_id="ceo_1", role=UserRole.CEO)
 
     try:
         resp = await container.chat_orchestrator.handle_message(
-            ChatRequest(session_id="sess_ev03", message=query),
+            ChatRequest(
+                session_id="sess_ev03",
+                message="What was our monthly churn rate for the last 6 months?",
+            ),
             ceo,
         )
         assert resp.sql_used is not None
