@@ -24,18 +24,37 @@ class AsyncRedisAdapter:
         redis_url: str,
         confirmation_ttl_seconds: int = 600,
         chat_history_ttl_seconds: int = 86400,
+        failure_cooldown_seconds: float = 60.0,
     ) -> None:
         self._confirmation_ttl = confirmation_ttl_seconds
         self._chat_history_ttl = chat_history_ttl_seconds
+        self._cooldown_seconds = max(0.0, failure_cooldown_seconds)
+        self._redis_disabled_until: float = 0.0
         self._mem_kv: dict[str, tuple[str, float | None]] = {}
         self._mem_lists: dict[str, list[str]] = defaultdict(list)
         self._redis = None
-        try:
-            import redis.asyncio as aioredis
+        if redis_url.strip():
+            try:
+                import redis.asyncio as aioredis
 
-            self._redis = aioredis.from_url(redis_url, decode_responses=True)
-        except Exception as exc:
-            logger.warning("Redis client init failed (%s); using in-memory store.", exc)
+                self._redis = aioredis.from_url(redis_url, decode_responses=True)
+            except Exception as exc:
+                logger.warning("Redis client init failed (%s); using in-memory store.", exc)
+
+    def _redis_available(self) -> bool:
+        return self._redis is not None and time.monotonic() >= self._redis_disabled_until
+
+    def _trip_redis_cooldown(self, op: str, exc: Exception) -> None:
+        if self._cooldown_seconds > 0:
+            self._redis_disabled_until = time.monotonic() + self._cooldown_seconds
+            logger.warning(
+                "Redis %s failed (%s); pausing Redis attempts for %.0fs and using in-memory fallback.",
+                op,
+                exc,
+                self._cooldown_seconds,
+            )
+        else:
+            logger.warning("Redis %s fallback: %s", op, exc)
 
     def _mem_set(self, key: str, raw: str, ttl_seconds: int) -> None:
         deadline = time.monotonic() + ttl_seconds if ttl_seconds > 0 else time.monotonic()
@@ -62,38 +81,38 @@ class AsyncRedisAdapter:
 
     async def get_json(self, key: str) -> Any | None:
         try:
-            if self._redis is not None:
+            if self._redis_available() and self._redis is not None:
                 raw = await self._redis.get(key)
                 return json.loads(raw) if raw else None
         except Exception as exc:
-            logger.warning("Redis GET fallback for key=%s: %s", key, exc)
+            self._trip_redis_cooldown(f"GET({key})", exc)
         raw = self._mem_get(key)
         return json.loads(raw) if raw else None
 
     async def set_json(self, key: str, value: Any, ttl_seconds: int = 300) -> None:
         encoded = json.dumps(value, default=str)
         try:
-            if self._redis is not None:
+            if self._redis_available() and self._redis is not None:
                 if ttl_seconds > 0:
                     await self._redis.set(key, encoded, ex=ttl_seconds)
                 else:
                     await self._redis.delete(key)
                 return
         except Exception as exc:
-            logger.warning("Redis SET fallback for key=%s: %s", key, exc)
+            self._trip_redis_cooldown(f"SET({key})", exc)
         self._mem_set(key, encoded, ttl_seconds)
 
     async def append_chat_message(self, session_id: str, msg: ChatMessage) -> None:
         key = f"chat_history:{session_id}"
         encoded = msg.model_dump_json()
         try:
-            if self._redis is not None:
+            if self._redis_available() and self._redis is not None:
                 await self._redis.rpush(key, encoded)
                 await self._redis.ltrim(key, -20, -1)
                 await self._redis.expire(key, self._chat_history_ttl)
                 return
         except Exception as exc:
-            logger.warning("Redis RPUSH fallback: %s", exc)
+            self._trip_redis_cooldown("RPUSH", exc)
         self._mem_lists[key].append(encoded)
         self._mem_lists[key] = self._mem_lists[key][-20:]
 
@@ -101,7 +120,7 @@ class AsyncRedisAdapter:
         key = f"chat_history:{session_id}"
         raw_items: list[str] = []
         try:
-            if self._redis is not None:
+            if self._redis_available() and self._redis is not None:
                 redis_items = await self._redis.lrange(key, -limit, -1)
                 raw_items = [
                     item if isinstance(item, str) else item.decode("utf-8") for item in redis_items
@@ -109,7 +128,7 @@ class AsyncRedisAdapter:
             else:
                 raw_items = self._mem_lists[key][-limit:]
         except Exception as exc:
-            logger.warning("Redis LRANGE fallback: %s", exc)
+            self._trip_redis_cooldown("LRANGE", exc)
             raw_items = self._mem_lists[key][-limit:]
         return [ChatMessage.model_validate_json(item) for item in raw_items]
 
@@ -122,14 +141,14 @@ class AsyncRedisAdapter:
     async def pop_pending(self, token: str, user_id: str) -> PendingConfirmation | None:
         key = f"hitl_confirm:{user_id}:{token}"
         try:
-            if self._redis is not None:
+            if self._redis_available() and self._redis is not None:
                 pipe = self._redis.pipeline()
                 pipe.get(key)
                 pipe.delete(key)
                 raw, _ = await pipe.execute()
                 return PendingConfirmation.model_validate_json(raw) if raw else None
         except Exception as exc:
-            logger.warning("Redis POP fallback: %s", exc)
+            self._trip_redis_cooldown("POP", exc)
         raw = self._mem_pop(key)
         return PendingConfirmation.model_validate_json(raw) if raw else None
 

@@ -51,7 +51,7 @@ class RetailAssistantCLI:
         self.container: ApplicationContainer | None = None
 
         profiles = load_user_rbac_profiles()
-        self.profile_key = user_key or "brand_manager_alice"
+        self.profile_key = user_key or os.getenv("PROTOTYPE_USER_PROFILE") or "brand_manager_alice"
         if self.profile_key not in profiles:
             raise ValueError(f"Unknown local RBAC profile: {self.profile_key}")
         self._apply_profile(self.profile_key)
@@ -262,6 +262,11 @@ class RetailAssistantCLI:
                     "approved": approved,
                 },
             )
+            if conf_resp.status_code != 200:
+                console.print(
+                    f"[bold red]API Error ({conf_resp.status_code}):[/bold red] {conf_resp.text}"
+                )
+                return None
             return conf_resp.json()
         except Exception as exc:
             console.print(f"[bold red]Error confirming operation:[/bold red] {exc}")
@@ -495,7 +500,7 @@ class RetailAssistantCLI:
             await self.container.startup()
 
         self.print_banner()
-        timeout = float(os.getenv("CLI_TIMEOUT_SECONDS", "60.0"))
+        timeout = float(os.getenv("CLI_TIMEOUT_SECONDS", "120.0"))
         client_ctx = httpx.AsyncClient(timeout=timeout) if not self.standalone else None
 
         try:
@@ -637,7 +642,7 @@ class RetailAssistantCLI:
                     if conf_data:
                         console.print(
                             Panel(
-                                Markdown(conf_data["reply"]),
+                                Markdown(conf_data.get("reply", "")),
                                 title="Confirmation Result",
                                 border_style="yellow",
                             )

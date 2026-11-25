@@ -17,6 +17,7 @@ from app.adapters.outbound.bigquery_adapter import BigQueryRunner
 from app.adapters.outbound.langchain_adapter import LangChainRetailAgentAdapter, LLMProvider
 from app.domain.budget import TurnBudget, turn_budget_scope
 from app.domain.exceptions import (
+    ExternalServiceUnavailableError,
     QueryBudgetExceededError,
     QueryExecutionError,
     SQLSafetyError,
@@ -504,3 +505,80 @@ async def test_standalone_cli_handles_domain_and_unexpected_errors_gracefully(
         assert "Unexpected Error" in capsys.readouterr().out
     finally:
         await container.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_bigquery_infrastructure_errors_fail_fast_without_sql_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ServiceUnavailable(Exception):
+        pass
+
+    ceo = UserContext(user_id="ceo_1", role=UserRole.CEO)
+
+    for idx, exc in enumerate(
+        (
+            TimeoutError("BigQuery timed out"),
+            ServiceUnavailable("503 backend unavailable"),
+        )
+    ):
+        container = ApplicationContainer(_resilience_test_settings(tmp_path, f"infra_{idx}.db"))
+        await container.startup()
+        sql_calls = 0
+
+        async def counting_sql_plan(**_kwargs: object) -> SQLPlan:
+            nonlocal sql_calls
+            sql_calls += 1
+            return SQLPlan(
+                reasoning="valid query",
+                sql_query="SELECT category FROM products",
+                requires_sql=True,
+            )
+
+        async def infra_fail_bq(_sql: str, err: Exception = exc) -> QueryExecutionResult:
+            raise err
+
+        monkeypatch.setattr(
+            container.chat_orchestrator._llm, "generate_sql_plan", counting_sql_plan
+        )
+        monkeypatch.setattr(container.chat_orchestrator._warehouse, "execute_query", infra_fail_bq)
+        try:
+            with pytest.raises(ExternalServiceUnavailableError):
+                await container.chat_orchestrator.handle_message(
+                    ChatRequest(session_id="s_infra", message="Show revenue by category"),
+                    ceo,
+                )
+            assert sql_calls == 1
+            counters = container.observability.get_metrics_snapshot()["counters"]
+            assert counters["warehouse_unavailable_total"] == 1
+        finally:
+            await container.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_redis_adapter_trips_cooldown_after_connection_failure() -> None:
+    from app.adapters.outbound.redis_and_telemetry import AsyncRedisAdapter
+
+    adapter = AsyncRedisAdapter(
+        redis_url="redis://localhost:6379/0",
+        failure_cooldown_seconds=60.0,
+    )
+    fake_redis = MagicMock()
+    calls = 0
+
+    async def fail_get(_key: str) -> None:
+        nonlocal calls
+        calls += 1
+        raise ConnectionRefusedError("Redis unreachable")
+
+    fake_redis.get = fail_get
+    adapter._redis = fake_redis
+
+    # First call hits fake_redis once, fails, and trips cooldown
+    assert await adapter.get_json("k1") is None
+    assert calls == 1
+
+    # Subsequent calls during cooldown bypass Redis entirely and use in-memory store
+    await adapter.set_json("k2", {"ok": True}, ttl_seconds=60)
+    assert await adapter.get_json("k2") == {"ok": True}
+    assert calls == 1

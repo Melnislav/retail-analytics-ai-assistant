@@ -22,6 +22,7 @@ from app.application.report_service import ReportService
 from app.domain.budget import TurnBudget, turn_budget_scope
 from app.domain.exceptions import (
     ConfirmationValidationError,
+    ExternalServiceUnavailableError,
     QueryBudgetExceededError,
     QueryExecutionError,
     SQLSafetyError,
@@ -295,6 +296,23 @@ class ChatOrchestratorService:
                     "fatal_error": exc,
                 }
             except Exception as exc:
+                if self._is_warehouse_infrastructure_error(exc):
+                    self._obs.increment_metric("warehouse_unavailable_total")
+                    logger.warning(
+                        "Attempt %d BigQuery infrastructure error (0 retries): %s",
+                        attempt,
+                        exc,
+                    )
+                    infra_exc = (
+                        exc
+                        if isinstance(exc, ExternalServiceUnavailableError)
+                        else ExternalServiceUnavailableError("BigQuery", str(exc))
+                    )
+                    return {
+                        "last_error": infra_exc.message,
+                        "last_sql": secured_sql,
+                        "fatal_error": infra_exc,
+                    }
                 err_msg = str(exc)
                 syntax_limit = min(2, max_additional_attempts)
                 logger.warning("Attempt %d BigQuery error: %s", attempt, err_msg)
@@ -896,6 +914,27 @@ class ChatOrchestratorService:
             guard_result.rows,
             guard_result.masked_groups_count + guard_result.stripped_demographic_cells,
         )
+
+    @staticmethod
+    def _is_warehouse_infrastructure_error(exc: Exception) -> bool:
+        """Identify transient/infra BigQuery failures that SQL repair cannot fix."""
+        if isinstance(
+            exc, (ExternalServiceUnavailableError, TimeoutError, ConnectionError, OSError)
+        ):
+            return True
+        return type(exc).__name__ in {
+            "ServiceUnavailable",
+            "DeadlineExceeded",
+            "TooManyRequests",
+            "PermissionDenied",
+            "Forbidden",
+            "Unauthenticated",
+            "InternalServerError",
+            "BadGateway",
+            "GatewayTimeout",
+            "RefreshError",
+            "DefaultCredentialsError",
+        }
 
     def _mask_text(self, text: str) -> str:
         """Return text safe for persistence in reports or exposure to a user."""

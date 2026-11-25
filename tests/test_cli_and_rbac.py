@@ -90,3 +90,30 @@ async def test_cli_user_switch_allowed_in_standalone_and_blocked_in_http_mode(
         assert "switched active user" in standalone_out.lower()
     finally:
         get_settings.cache_clear()
+
+
+def test_cli_client_respects_prototype_user_profile_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROTOTYPE_USER_PROFILE", "ceo")
+    cli = RetailAssistantCLI()
+    assert cli.profile_key == "ceo"
+    assert cli.user_id == "ceo_carol"
+    assert cli.user_role == "ceo"
+
+
+@pytest.mark.asyncio
+async def test_cli_confirm_action_handles_non_200_http_response(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import httpx
+
+    transport = httpx.MockTransport(
+        lambda _req: httpx.Response(status_code=503, text="Service unavailable")
+    )
+    cli = RetailAssistantCLI(base_url="http://test-server:8000", standalone=False)
+    async with httpx.AsyncClient(transport=transport) as client:
+        res = await cli._confirm_action(client, "confirm_abc123", True)
+
+    assert res is None
+    assert "API Error (503)" in capsys.readouterr().out
