@@ -2,21 +2,17 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.adapters.inbound.http_api import router as api_router
-from app.infrastructure.config import get_settings
+from app.infrastructure.config import configure_logging, get_settings
 from app.infrastructure.container import ApplicationContainer
 
 settings = get_settings()
-logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+configure_logging(settings.log_level)
 
 
 @asynccontextmanager

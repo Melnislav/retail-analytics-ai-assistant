@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -94,7 +95,7 @@ class GuardrailDecision(BaseModel):
     rejection_reason: str | None = None
     delete_scope: str | None = Field(
         default=None,
-        description="For DELETE_REPORTS: 'conversation' or 'keyword'",
+        description="For DELETE_REPORTS: 'conversation', 'keyword', or 'all'",
     )
     delete_keyword: str | None = Field(
         default=None,
@@ -135,6 +136,7 @@ class SQLValidationResult(BaseModel):
     sanitized_sql: str = ""
     violations: list[str] = Field(default_factory=list)
     applied_rbac_filters: list[str] = Field(default_factory=list)
+    severity: Literal["none", "soft", "hard"] = "none"
 
 
 class QueryExecutionResult(BaseModel):
@@ -173,6 +175,7 @@ class SavedReport(BaseModel):
     report_id: str = Field(default_factory=lambda: str(uuid4()))
     owner_user_id: str
     session_id: str
+    question: str = ""
     title: str
     summary: str
     content_markdown: str
@@ -196,7 +199,17 @@ class PendingConfirmation(BaseModel):
     description: str
     target_report_ids: list[str]
     target_report_titles: list[str]
+    target_report_created_at: list[str] = Field(default_factory=list)
+    nonce: str = Field(default_factory=lambda: uuid4().hex[:16])
+    payload_hash: str = ""
     created_at: datetime = Field(default_factory=utc_now)
+    expires_at: datetime | None = None
+
+    @staticmethod
+    def compute_payload_hash(report_ids: list[str], user_id: str, nonce: str) -> str:
+        """Compute canonical SHA-256 snapshot hash binding target IDs, owner, and nonce."""
+        canonical = f"{'|'.join(sorted(set(report_ids)))}|{user_id}|{nonce}"
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class ChatMessage(BaseModel):
@@ -211,7 +224,10 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     """Inbound chat request payload."""
 
-    session_id: str = Field(default_factory=lambda: f"sess_{uuid4().hex[:10]}")
+    session_id: str = Field(
+        default_factory=lambda: f"sess_{uuid4().hex[:10]}",
+        pattern=r"^[A-Za-z0-9_-]{1,128}$",
+    )
     message: str = Field(..., min_length=1, max_length=4000)
     save_report: bool = Field(
         default=False,
@@ -222,8 +238,8 @@ class ChatRequest(BaseModel):
 class ConfirmationRequest(BaseModel):
     """Inbound payload to approve or cancel a high-stakes destructive action."""
 
-    session_id: str
-    token: str
+    session_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    token: str = Field(pattern=r"^confirm_[A-Za-z0-9]+$")
     approved: bool
 
 
@@ -244,3 +260,26 @@ class ChatResponse(BaseModel):
         default_factory=list,
         description="Explicit retail metric definitions applied during this analysis turn.",
     )
+
+
+class TraceRecord(BaseModel):
+    """Privacy-safe local execution trace for correlation, debugging, and cost tracking."""
+
+    trace_id: str
+    user_id: str
+    session_id: str
+    persona_version: str = "default"
+    intent_classified: str = "unknown"
+    generated_sql: str | None = None
+    ast_valid: bool | None = None
+    bq_bytes_billed: int = 0
+    llm_calls_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_cost_usd: float = 0.0
+    latency_ms: float = 0.0
+    error_type: str | None = None
+    pii_redacted_prompt: str = ""
+    pii_redacted_response: str = ""
+    fallback_used: bool = False
+    created_at: datetime = Field(default_factory=utc_now)

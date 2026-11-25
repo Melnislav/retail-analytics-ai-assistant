@@ -5,11 +5,14 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableLambda
 
+from app.domain.budget import get_active_turn_budget
+from app.domain.exceptions import TurnBudgetExceededError
 from app.domain.models import (
     AnalysisDepthPreference,
     AnalystSynthesis,
@@ -24,17 +27,32 @@ from app.domain.models import (
     UserPreferenceProfile,
 )
 from app.domain.pii_masker import PIIMasker
-from app.domain.semantic_glossary import SemanticGlossary
+from app.domain.semantic_glossary import SemanticGlossary, get_active_glossary
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+# Fail-closed signal set. When no LLM verdict is available, a message that mentions none of
+# these terms is refused instead of being silently treated as an analytical request.
+RETAIL_SIGNAL_PATTERN = re.compile(
+    r"\b(?:revenue|sales?|orders?|order_items|items?|units?|sold|products?|skus?|brands?|"
+    r"categor(?:y|ies)|customers?|users?|churn|retention|cohorts?|aov|ltv|gmv|margins?|"
+    r"profits?|baskets?|discounts?|campaigns?|prices?|pricing|refunds?|returns?|inventory|"
+    r"stock|shipping|fulfillment|stores?|channels?|conversion|funnel|traffic|sessions?|"
+    r"kpis?|metrics?|sql|schemas?|tables?|datasets?|bigquery|trends?|forecast|growth|"
+    r"spend|spending|quantity|amount|transactions?)\b"
+    r"|\b(?:выручк|продаж|заказ|товар|продукт|бренд|клиент|покупател|отток|маржинальн|"
+    r"прибыл|скидк|возврат|корзин|категор|склад|метрик|отч[её]т|таблиц|схем|показател)\w*",
+    re.IGNORECASE,
+)
 
 
 @dataclass
 class LLMProvider:
     name: str
     model: BaseChatModel
+    model_name: str = ""
 
 
 class LangChainRetailAgentAdapter:
@@ -44,7 +62,7 @@ class LangChainRetailAgentAdapter:
         self,
         provider: str = "gemini",
         google_api_key: str = "",
-        gemini_model: str = "gemini-3.8-flash",
+        gemini_model: str = "gemini-2.5-flash",
         openrouter_api_key: str = "",
         openrouter_model: str = "google/gemma-4-31b-it:free",
         openrouter_base_url: str = "https://openrouter.ai/api/v1",
@@ -113,6 +131,7 @@ class LangChainRetailAgentAdapter:
                     LLMProvider(
                         name="gemini",
                         model=gemini_llm,
+                        model_name=gemini_model,
                     )
                 )
             except Exception as exc:
@@ -135,6 +154,7 @@ class LangChainRetailAgentAdapter:
                     LLMProvider(
                         name="openrouter",
                         model=openrouter_llm,
+                        model_name=openrouter_model,
                     )
                 )
             except Exception as exc:
@@ -156,6 +176,7 @@ class LangChainRetailAgentAdapter:
                     LLMProvider(
                         name="openai",
                         model=openai_llm,
+                        model_name=openai_model,
                     )
                 )
             except Exception as exc:
@@ -171,6 +192,29 @@ class LangChainRetailAgentAdapter:
         providers.sort(key=lambda p: 0 if p.name.lower() == provider.lower() else 1)
         return providers
 
+    def _record_token_usage(self, raw: Any) -> None:
+        budget = get_active_turn_budget()
+        if budget is None or raw is None:
+            return
+        usage = getattr(raw, "usage_metadata", None)
+        if not isinstance(usage, dict):
+            return
+        in_tokens = int(usage.get("input_tokens") or 0)
+        out_tokens = int(usage.get("output_tokens") or 0)
+        resp_meta = getattr(raw, "response_metadata", None)
+        model_name = (
+            str(resp_meta.get("model_name") or resp_meta.get("model") or "")
+            if isinstance(resp_meta, dict)
+            else ""
+        )
+        if not model_name and self._providers:
+            model_name = self._providers[0].model_name
+        budget.record_usage(
+            input_tokens=in_tokens,
+            output_tokens=out_tokens,
+            model_name=model_name,
+        )
+
     async def _invoke_with_resilience(
         self,
         schema: type[T],
@@ -178,29 +222,56 @@ class LangChainRetailAgentAdapter:
         task_name: str,
     ) -> T | None:
         if not self._providers:
+            budget = get_active_turn_budget()
+            if budget is not None:
+                budget.record_fallback()
             return None
 
         safe_messages = self._mask_messages(messages)
 
-        structured_models = [
-            entry.model.with_structured_output(schema) for entry in self._providers
+        structured_models: list[Any] = []
+        for entry in self._providers:
+            try:
+                structured_models.append(
+                    entry.model.with_structured_output(schema, include_raw=True)
+                )
+            except TypeError:
+                structured_models.append(entry.model.with_structured_output(schema))
+
+        def _mark_provider_fallback(value: Any) -> Any:
+            budget = get_active_turn_budget()
+            if budget is not None:
+                budget.record_fallback()
+            return value
+
+        fallback_models = [
+            model | RunnableLambda(_mark_provider_fallback) for model in structured_models[1:]
         ]
-        provider_chain = structured_models[0].with_fallbacks(structured_models[1:])
+        provider_chain = structured_models[0].with_fallbacks(fallback_models)
         try:
-            result = await provider_chain.ainvoke(safe_messages)  # type: ignore[arg-type]
+            result = await provider_chain.ainvoke(safe_messages)
+            if isinstance(result, dict) and ("parsed" in result or "raw" in result):
+                self._record_token_usage(result.get("raw"))
+                parsing_error = result.get("parsing_error")
+                parsed = result.get("parsed")
+                if parsing_error is not None or parsed is None:
+                    raise ValueError(f"Structured output parsing failed: {parsing_error}")
+                return cast(T, parsed)
             return cast(T, result)
+        except TurnBudgetExceededError:
+            raise
         except Exception as exc:
             logger.warning(
-                "All configured LLM providers (%s) failed during %s: %s",
+                "All configured LLM providers (%s) failed during %s (%s); "
+                "falling back to deterministic heuristic rules.",
                 ", ".join(entry.name for entry in self._providers),
                 task_name,
                 exc,
             )
 
-        logger.warning(
-            "Falling back to deterministic heuristic rules during %s.",
-            task_name,
-        )
+        budget = get_active_turn_budget()
+        if budget is not None:
+            budget.record_fallback()
         return None
 
     def _mask_messages(
@@ -240,7 +311,9 @@ class LangChainRetailAgentAdapter:
             "3. Block unrelated non-retail requests (e.g., jokes, poems, politics, coding help) -> BLOCKED_OFF_TOPIC.\n"
             "4. Detect destructive report deletion requests:\n"
             "   - 'Delete all the reports we made in this conversation' -> DELETE_REPORTS, delete_scope='conversation'\n"
+            "   - 'Delete all my saved reports' -> DELETE_REPORTS, delete_scope='all'\n"
             "   - 'Delete all reports mentioning Client X' -> DELETE_REPORTS, delete_scope='keyword', delete_keyword='Client X'\n"
+            "   - 'Delete report <id>' -> DELETE_REPORTS, delete_scope='keyword', delete_keyword='<id>'\n"
             "5. Detect user output preferences if stated (tables vs bullets, concise vs deep_dive)."
         )
         messages: list[SystemMessage | HumanMessage | AIMessage] = [
@@ -253,9 +326,9 @@ class LangChainRetailAgentAdapter:
         )
         if decision is not None:
             return decision
-        return self._heuristic_guardrail(user_message)
+        return self._heuristic_guardrail(user_message, has_history=bool(history))
 
-    def _heuristic_guardrail(self, text: str) -> GuardrailDecision:
+    def _heuristic_guardrail(self, text: str, has_history: bool = False) -> GuardrailDecision:
         low = text.lower()
         injection_markers = [
             "ignore previous",
@@ -280,13 +353,32 @@ class LangChainRetailAgentAdapter:
                     is_safe=True,
                     delete_scope="conversation",
                 )
-            match = re.search(r"mentioning\s+['\"]?([^'\"]+)['\"]?", text, flags=re.IGNORECASE)
-            keyword = match.group(1).strip() if match else text.split("report")[-1].strip(" .?!")
+            mention_match = re.search(
+                r"mentioning\s+['\"`]?([^'\"`]+?)['\"`]?[.?!]*$",
+                text.strip(),
+                flags=re.IGNORECASE,
+            )
+            if mention_match:
+                return GuardrailDecision(
+                    intent=IntentType.DELETE_REPORTS,
+                    is_safe=True,
+                    delete_scope="keyword",
+                    delete_keyword=mention_match.group(1).strip(),
+                )
+            trailing = re.split(r"\breports?\b", text, maxsplit=1, flags=re.IGNORECASE)[-1].strip(
+                " .?!'\"`#"
+            )
+            if re.search(r"\ball\b", low) and not trailing:
+                return GuardrailDecision(
+                    intent=IntentType.DELETE_REPORTS,
+                    is_safe=True,
+                    delete_scope="all",
+                )
             return GuardrailDecision(
                 intent=IntentType.DELETE_REPORTS,
                 is_safe=True,
                 delete_scope="keyword",
-                delete_keyword=keyword or "Client",
+                delete_keyword=trailing or "Client",
             )
 
         if ("list" in low or "show" in low) and "saved report" in low:
@@ -313,6 +405,15 @@ class LangChainRetailAgentAdapter:
             )
 
         should_save = "create a report" in low or "save report" in low or "generate a report" in low
+        if not should_save and not has_history and not RETAIL_SIGNAL_PATTERN.search(low):
+            return GuardrailDecision(
+                intent=IntentType.BLOCKED_OFF_TOPIC,
+                is_safe=False,
+                rejection_reason=(
+                    "I can only answer retail analytics questions. Please name a metric, "
+                    "product, brand, customer segment, or reporting task."
+                ),
+            )
         return GuardrailDecision(
             intent=IntentType.DATA_ANALYSIS,
             is_safe=True,
@@ -330,8 +431,9 @@ class LangChainRetailAgentAdapter:
         previous_error: str | None = None,
         previous_sql: str | None = None,
     ) -> SQLPlan:
+        glossary = get_active_glossary(self._glossary)
         retry_context = ""
-        if self._glossary.has_unsupported_configured_churn_scope(user_message):
+        if glossary.has_unsupported_configured_churn_scope(user_message):
             return self._clarification_plan("unsupported_configured_churn_scope")
         if previous_error:
             retry_context = (
@@ -339,7 +441,7 @@ class LangChainRetailAgentAdapter:
                 "Fix the SQL query carefully so it executes cleanly on BigQuery StandardSQL."
             )
 
-        glossary_rules = self._glossary.format_system_prompt_section()
+        glossary_rules = glossary.format_system_prompt_section()
         system_prompt = (
             "You are a Principal Retail Data Analyst generating BigQuery StandardSQL.\n"
             f"Available Schema:\n{schema_summary}\n\n"
@@ -348,8 +450,12 @@ class LangChainRetailAgentAdapter:
             f"1. Generate ONLY read-only SELECT queries against `{self._dataset_id}`.\n"
             "2. NEVER select PII columns (`first_name`, `last_name`, `email`, `street_address`, `postal_code`, `latitude`, `longitude`).\n"
             "3. Demographics (`age`, `gender`, `city`, `state`, `country`, `traffic_source`) "
-            "must only appear as GROUP BY dimensions and must include "
-            f"HAVING COUNT(DISTINCT u.id) >= {self._demographic_min_group_size}.\n"
+            "must be qualified as `u.<column>`, appear only in explicit `GROUP BY u.<column>` "
+            "(never positional `GROUP BY 1`), and include "
+            f"`HAVING COUNT(DISTINCT u.id) >= {self._demographic_min_group_size}`. "
+            "Compute per-customer metrics in a single SELECT (e.g., "
+            "`ROUND(SAFE_DIVIDE(SUM(oi.sale_price), COUNT(DISTINCT u.id)), 2)`) without "
+            "selecting `u.id`/`user_id` alongside demographic columns in subqueries or CTEs.\n"
             "4. Always aggregate metrics cleanly (ROUND floats to 2 decimals) and include an ORDER BY + LIMIT.\n"
             "5. If the user asks about available tables/schema structure only, set `requires_sql=False`.\n"
             "6. Always adhere to the business metric formulas in the Semantic Glossary above, unless the user provides their own explicit definition in their prompt."
@@ -364,7 +470,7 @@ class LangChainRetailAgentAdapter:
         plan = await self._invoke_with_resilience(SQLPlan, messages, "generate_sql_plan")
         applied_defs = [
             f"{m.name}: {m.description} (Formula: {m.sql_formula})"
-            for m in self._glossary.detect_metrics(user_message)
+            for m in glossary.detect_metrics(user_message)
         ]
         if plan is not None:
             if not plan.applied_metric_definitions:
@@ -374,12 +480,13 @@ class LangChainRetailAgentAdapter:
         return fallback_plan.model_copy(update={"applied_metric_definitions": applied_defs})
 
     def _heuristic_sql_plan(self, user_message: str) -> SQLPlan:
+        glossary = get_active_glossary(self._glossary)
         low = user_message.lower()
         has_churn = "churn" in low or "отток" in low
         has_returns = any(word in low for word in ("return", "cancel", "возврат", "отмен"))
-        if self._glossary.has_unsupported_cancelled_order_churn_override(user_message):
+        if glossary.has_unsupported_cancelled_order_churn_override(user_message):
             return self._clarification_plan("unsupported_cancelled_order_churn_override")
-        if self._glossary.has_unsupported_configured_churn_scope(user_message):
+        if glossary.has_unsupported_configured_churn_scope(user_message):
             return self._clarification_plan("unsupported_configured_churn_scope")
         if "schema" in low or "what tables" in low or "what data is available" in low:
             return SQLPlan(
@@ -398,7 +505,7 @@ class LangChainRetailAgentAdapter:
                 f"ORDER BY avg_spend_usd DESC LIMIT 20"
             )
         elif has_churn and ("return" in low or "возврат" in low):
-            churn_days = self._glossary.churn_inactivity_days(user_message)
+            churn_days = glossary.churn_inactivity_days(user_message)
             sql = (
                 f"WITH customer_activity AS (\n"
                 f"  SELECT user_id, MAX(created_at) AS last_order_at\n"
@@ -431,7 +538,7 @@ class LangChainRetailAgentAdapter:
         elif "aov" in low or "average order value" in low or "basket size" in low:
             status_filter = (
                 "status != 'Cancelled'"
-                if self._glossary.aov_includes_returns(user_message)
+                if glossary.aov_includes_returns(user_message)
                 else "status = 'Complete'"
             )
             sql = (
@@ -440,7 +547,7 @@ class LangChainRetailAgentAdapter:
                 f"WHERE {status_filter}"
             )
         elif has_churn:
-            churn_days = self._glossary.churn_inactivity_days(user_message)
+            churn_days = glossary.churn_inactivity_days(user_message)
             sql = (
                 f"WITH customer_activity AS (\n"
                 f"  SELECT user_id, MAX(created_at) AS last_order_at\n"
@@ -454,7 +561,7 @@ class LangChainRetailAgentAdapter:
                 f"  ROUND(SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN last_order_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {churn_days} DAY) THEN user_id END), COUNT(DISTINCT user_id)) * 100, 2) AS churn_rate_pct\n"
                 f"FROM customer_activity"
             )
-        elif self._glossary.revenue_includes_returns(user_message):
+        elif glossary.revenue_includes_returns(user_message):
             sql = (
                 f"SELECT p.category, p.department, COUNT(DISTINCT oi.order_id) AS orders_count, "
                 f"ROUND(SUM(oi.sale_price), 2) AS revenue_usd "
@@ -484,7 +591,7 @@ class LangChainRetailAgentAdapter:
                 f"GROUP BY p.category ORDER BY net_revenue_usd DESC LIMIT 20"
             )
         elif "repeat" in low or "повторн" in low:
-            min_orders = self._glossary.repeat_customer_min_orders(user_message)
+            min_orders = glossary.repeat_customer_min_orders(user_message)
 
             sql = (
                 f"WITH scoped_orders AS (\n"
@@ -537,11 +644,12 @@ class LangChainRetailAgentAdapter:
 
     def _clarification_plan(self, message_key: str) -> SQLPlan:
         """Build a no-query response for a metric rule the application cannot apply safely."""
+        glossary = get_active_glossary(self._glossary)
         return SQLPlan(
             reasoning="The requested metric definition cannot be applied safely.",
             sql_query="",
             requires_sql=False,
-            response_message=self._glossary.clarification_message(message_key),
+            response_message=glossary.clarification_message(message_key),
         )
 
     async def synthesize_response(
@@ -552,10 +660,11 @@ class LangChainRetailAgentAdapter:
         preferences: UserPreferenceProfile,
         history: list[ChatMessage],
     ) -> AnalystSynthesis:
+        glossary = get_active_glossary(self._glossary)
         rows_preview = query_result.rows[:30] if query_result else []
         sql_used = query_result.sql_executed if query_result else "N/A (Metadata response)"
 
-        matched_metrics = self._glossary.detect_metrics(
+        matched_metrics = glossary.detect_metrics(
             user_message + " " + (query_result.sql_executed if query_result else "")
         )
         applied_defs = (
@@ -564,7 +673,7 @@ class LangChainRetailAgentAdapter:
             else [f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in matched_metrics]
         )
         glossary_hint = (
-            f"\nRelevant Metric Definitions:\n{self._glossary.format_response_definitions(matched_metrics)}\n"
+            f"\nRelevant Metric Definitions:\n{glossary.format_response_definitions(matched_metrics)}\n"
             if matched_metrics
             else ""
         )
@@ -581,10 +690,18 @@ class LangChainRetailAgentAdapter:
             f"{glossary_hint}"
             "Provide clear executive insights grounded strictly in the query data and concrete Q2/next-step action items."
         )
+        empty_notice = ""
+        if query_result is not None and query_result.row_count == 0:
+            empty_notice = (
+                "\nIMPORTANT: The executed query returned 0 rows. Do NOT fabricate numbers. "
+                "Explain clearly that no matching records were found within your authorized brand scope "
+                "and filters, and ask a clarifying question to broaden date ranges or filter criteria."
+            )
         prompt_body = (
             f"Executive Question: {user_message}\n"
             f"Executed SQL:\n{sql_used}\n\n"
-            f"Anonymized Query Results ({query_result.row_count if query_result else 0} rows):\n{rows_preview}"
+            f"Anonymized Query Results ({query_result.row_count if query_result else 0} rows):\n"
+            f"{rows_preview}{empty_notice}"
         )
         messages: list[SystemMessage | HumanMessage | AIMessage] = [
             SystemMessage(content=system_prompt),
@@ -607,7 +724,8 @@ class LangChainRetailAgentAdapter:
         persona: PersonaConfig,
         preferences: UserPreferenceProfile,
     ) -> AnalystSynthesis:
-        matched_metrics = self._glossary.detect_metrics(
+        glossary = get_active_glossary(self._glossary)
+        matched_metrics = glossary.detect_metrics(
             user_message + " " + (query_result.sql_executed if query_result else "")
         )
         used_defs = (
@@ -616,12 +734,12 @@ class LangChainRetailAgentAdapter:
             else [f"{m.name}: {m.description} (Formula: {m.sql_formula})" for m in matched_metrics]
         )
         glossary_section = (
-            "\n\n" + self._glossary.format_response_definitions(matched_metrics)
+            "\n\n" + glossary.format_response_definitions(matched_metrics)
             if matched_metrics
             else ""
         )
 
-        if query_result is None or not query_result.rows:
+        if query_result is None:
             return AnalystSynthesis(
                 executive_summary=(
                     f"Available dataset `{self._dataset_id}` includes `orders`, "
@@ -638,6 +756,29 @@ class LangChainRetailAgentAdapter:
                     "Compare state-level repeat purchase and return rates to identify regional bottlenecks.",
                 ],
                 report_title="Dataset Capability Overview",
+                used_metric_definitions=used_defs,
+            )
+
+        if not query_result.rows:
+            return AnalystSynthesis(
+                executive_summary=(
+                    "No matching records were found for this query within your authorized "
+                    "brand scope and active filters."
+                ),
+                detailed_analysis=(
+                    "The analytical query executed successfully against the warehouse, but "
+                    "returned 0 rows (either because the filters were too narrow or demographic "
+                    "groups were below the minimum privacy threshold)."
+                    f"{glossary_section}"
+                ),
+                action_items=[
+                    "Clarify or broaden the date range, product category, or brand/status filter and re-run.",
+                    "Check spelling and casing of any filter values mentioned in your question.",
+                ],
+                follow_up_suggestions=[
+                    "Would you like to expand the date window or relax one of the active filters?"
+                ],
+                report_title=f"No Matching Data: {user_message[:50]}",
                 used_metric_definitions=used_defs,
             )
 

@@ -3,36 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 from typing import Any
 
-SENSITIVE_COLUMN_NAMES = frozenset(
-    {
-        "email",
-        "user_email",
-        "customer_email",
-        "first_name",
-        "last_name",
-        "full_name",
-        "name",
-        "street_address",
-        "address",
-        "postal_code",
-        "zip",
-        "zipcode",
-        "latitude",
-        "longitude",
-        "user_geom",
-        "coordinates",
-        "ip_address",
-        "phone",
-        "phone_number",
-        "ssn",
-    }
-)
+from app.domain.privacy_policy import DEFAULT_PRIVACY_POLICY, PrivacyPolicy
+
+SENSITIVE_COLUMN_NAMES = DEFAULT_PRIVACY_POLICY.pii_columns
 
 # Columns that can be pseudonymized rather than dropped when grouping by customer is needed
-PSEUDONYMIZED_ID_COLUMNS = frozenset({"user_id", "customer_id"})
+PSEUDONYMIZED_ID_COLUMNS = DEFAULT_PRIVACY_POLICY.user_identifier_columns
 
 EMAIL_REGEX = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE_REGEX = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b")
@@ -61,11 +41,20 @@ LABELED_PII_REGEX = re.compile(
 class PIIMasker:
     """Enforces zero-PII leakage across tabular results and natural-language outputs."""
 
-    def __init__(self, salt: str = "retail-pii-salt-2026") -> None:
+    def __init__(
+        self,
+        salt: str = "retail-pii-salt-2026",
+        policy: PrivacyPolicy | None = None,
+    ) -> None:
         self._salt = salt
+        self._policy = policy or DEFAULT_PRIVACY_POLICY
 
     def pseudonymize_id(self, raw_id: Any) -> str:
-        digest = hashlib.sha256(f"{self._salt}:{raw_id}".encode()).hexdigest()[:10]
+        digest = hmac.new(
+            self._salt.encode("utf-8"),
+            str(raw_id).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()[:12]
         return f"CUST_{digest.upper()}"
 
     def mask_text(self, text: str) -> tuple[str, int]:
@@ -104,10 +93,10 @@ class PIIMasker:
             clean_row: dict[str, Any] = {}
             for col, val in row.items():
                 col_lower = col.lower()
-                if col_lower in SENSITIVE_COLUMN_NAMES:
+                if self._policy.is_pii_column(col_lower):
                     clean_row[col] = "[REDACTED_PII]"
                     total_redactions += 1
-                elif col_lower in PSEUDONYMIZED_ID_COLUMNS and val is not None:
+                elif self._policy.is_user_identifier_column(col_lower) and val is not None:
                     clean_row[col] = self.pseudonymize_id(val)
                 elif isinstance(val, str):
                     clean_val, count = self.mask_text(val)

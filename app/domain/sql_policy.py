@@ -2,38 +2,21 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
 from app.domain.models import SQLValidationResult, UserContext, UserRole
+from app.domain.privacy_policy import DEFAULT_PRIVACY_POLICY, PrivacyPolicy
 
 ALLOWED_TABLES = frozenset({"orders", "order_items", "products", "users"})
 INTERNAL_CTES = frozenset(
     {"__allowed_products", "__scoped_order_items", "__scoped_orders", "__scoped_users"}
 )
-FORBIDDEN_PII_COLUMNS = frozenset(
-    {
-        "email",
-        "first_name",
-        "last_name",
-        "full_name",
-        "street_address",
-        "address",
-        "postal_code",
-        "zip",
-        "zipcode",
-        "latitude",
-        "longitude",
-        "user_geom",
-        "coordinates",
-        "ip_address",
-        "phone",
-        "phone_number",
-        "ssn",
-    }
-)
-DEMOGRAPHIC_COLUMNS = frozenset({"age", "gender", "city", "state", "country", "traffic_source"})
+FORBIDDEN_PII_COLUMNS = DEFAULT_PRIVACY_POLICY.pii_columns
+DEMOGRAPHIC_COLUMNS = DEFAULT_PRIVACY_POLICY.demographic_columns
 
 
 class SQLPolicyEngine:
@@ -44,10 +27,14 @@ class SQLPolicyEngine:
         dataset_id: str = "bigquery-public-data.thelook_ecommerce",
         default_limit: int = 200,
         demographic_min_group_size: int = 5,
+        privacy_policy: PrivacyPolicy | None = None,
     ) -> None:
         self._dataset_id = dataset_id
         self._default_limit = default_limit
-        self._demographic_min_group_size = demographic_min_group_size
+        self._policy = privacy_policy or PrivacyPolicy(
+            demographic_min_group_size=demographic_min_group_size
+        )
+        self._demographic_min_group_size = self._policy.demographic_min_group_size
         dataset_parts = dataset_id.split(".")
         if len(dataset_parts) != 2:
             raise ValueError("dataset_id must use '<project>.<dataset>' format")
@@ -56,7 +43,11 @@ class SQLPolicyEngine:
     def validate_and_secure(self, raw_sql: str, user: UserContext) -> SQLValidationResult:
         cleaned = raw_sql.strip().rstrip(";")
         if not cleaned:
-            return SQLValidationResult(is_valid=False, violations=["Empty SQL query generated."])
+            return SQLValidationResult(
+                is_valid=False,
+                violations=["Empty SQL query generated."],
+                severity="soft",
+            )
 
         try:
             statements = sqlglot.parse(cleaned, read="bigquery")
@@ -64,24 +55,32 @@ class SQLPolicyEngine:
             return SQLValidationResult(
                 is_valid=False,
                 violations=[f"Invalid BigQuery SQL: {exc}"],
+                severity="soft",
             )
 
         if len(statements) != 1 or not isinstance(statements[0], exp.Query):
             return SQLValidationResult(
                 is_valid=False,
                 violations=["Exactly one read-only SELECT/WITH query is required."],
+                severity="hard",
             )
 
         query = statements[0]
-        violations = self._validate_query(query)
+        hard_violations, soft_violations = self._validate_query(query)
         restricted = user.role not in {UserRole.CEO, UserRole.ADMIN}
         if restricted and not user.allowed_brands:
-            violations.append(
+            hard_violations.append(
                 "Non-CEO users must have at least one authorized brand; access fails closed."
             )
 
+        violations = [*hard_violations, *soft_violations]
         if violations:
-            return SQLValidationResult(is_valid=False, violations=violations)
+            severity: Literal["none", "soft", "hard"] = "hard" if hard_violations else "soft"
+            return SQLValidationResult(
+                is_valid=False,
+                violations=violations,
+                severity=severity,
+            )
 
         if query.args.get("limit") is None:
             query = query.limit(self._default_limit)
@@ -102,14 +101,15 @@ class SQLPolicyEngine:
             applied_rbac_filters=applied_filters,
         )
 
-    def _validate_query(self, query: exp.Query) -> list[str]:
-        violations: list[str] = []
+    def _validate_query(self, query: exp.Query) -> tuple[list[str], list[str]]:
+        hard_violations: list[str] = []
+        soft_violations: list[str] = []
         cte_names = {
             cte.alias_or_name.lower() for cte in query.find_all(exp.CTE) if cte.alias_or_name
         }
         reserved_ctes = sorted(cte_names.intersection(INTERNAL_CTES))
         if reserved_ctes:
-            violations.append(
+            hard_violations.append(
                 f"Reserved security CTE names cannot be supplied: {', '.join(reserved_ctes)}."
             )
 
@@ -122,15 +122,15 @@ class SQLPolicyEngine:
             physical_tables.append(table)
 
             if table_name not in ALLOWED_TABLES:
-                violations.append(
+                hard_violations.append(
                     f"Access to table '{table.name}' is not permitted. "
                     f"Allowed tables: {sorted(ALLOWED_TABLES)}."
                 )
                 continue
             if table.catalog and table.catalog.lower() != self._project_id.lower():
-                violations.append(f"Table '{table.sql()}' is outside the configured project.")
+                hard_violations.append(f"Table '{table.sql()}' is outside the configured project.")
             if table.db and table.db.lower() != self._dataset_name.lower():
-                violations.append(f"Table '{table.sql()}' is outside the configured dataset.")
+                hard_violations.append(f"Table '{table.sql()}' is outside the configured dataset.")
 
         users_aliases = {
             table.alias_or_name.lower()
@@ -139,13 +139,15 @@ class SQLPolicyEngine:
         }
 
         if any(not isinstance(star.parent, exp.Count) for star in query.find_all(exp.Star)):
-            violations.append("Wildcard projections are prohibited because they can expose PII.")
+            soft_violations.append(
+                "Wildcard projections are prohibited because they can expose PII."
+            )
 
         if any(
             not column.table and column.name.lower() in users_aliases
             for column in query.find_all(exp.Column)
         ):
-            violations.append(
+            hard_violations.append(
                 "Whole users-table row references are prohibited because they expose PII."
             )
 
@@ -153,45 +155,91 @@ class SQLPolicyEngine:
             {
                 column.name.lower()
                 for column in query.find_all(exp.Column)
-                if column.name.lower() in FORBIDDEN_PII_COLUMNS
+                if self._policy.is_pii_column(column.name)
             }
         )
         if forbidden_columns:
-            violations.append(
+            hard_violations.append(
                 "PII source columns are prohibited even when renamed with an alias: "
                 + ", ".join(forbidden_columns)
                 + "."
             )
 
-        violations.extend(self._validate_demographics(query, physical_tables))
-        return violations
+        demo_hard, demo_soft = self._validate_demographics(query, physical_tables)
+        hard_violations.extend(demo_hard)
+        soft_violations.extend(demo_soft)
+        return hard_violations, soft_violations
 
     def _validate_demographics(
         self,
         query: exp.Query,
         physical_tables: list[exp.Table],
-    ) -> list[str]:
+    ) -> tuple[list[str], list[str]]:
         demographic_columns = [
             column
             for column in query.find_all(exp.Column)
-            if column.name.lower() in DEMOGRAPHIC_COLUMNS
+            if self._policy.is_demographic_column(column.name)
         ]
         if not demographic_columns:
-            return []
+            return [], []
 
-        violations: list[str] = []
+        hard_violations: list[str] = []
+        soft_violations: list[str] = []
         users_aliases = {
             table.alias_or_name.lower()
             for table in physical_tables
             if table.name.lower() == "users" and table.alias_or_name
         }
 
+        hard_linkage_blocked = False
+        soft_linkage_blocked = False
         for select in query.find_all(exp.Select):
+            is_outer_select = select.find_ancestor(exp.CTE, exp.Subquery) is None
+            select_touches_demographics = any(
+                self._policy.is_demographic_column(col.name)
+                and col.find_ancestor(exp.Select) is select
+                for col in select.find_all(exp.Column)
+            )
+            if is_outer_select or select_touches_demographics:
+                has_users_table = any(
+                    t.name.lower() == "users" and t.find_ancestor(exp.Select) is select
+                    for t in select.find_all(exp.Table)
+                )
+                for projection in select.expressions:
+                    if any(
+                        col.find_ancestor(exp.Select) is select
+                        and col.find_ancestor(exp.AggFunc) is None
+                        and (
+                            self._policy.is_user_identifier_column(col.name)
+                            or (
+                                col.name.lower() == "id"
+                                and (
+                                    col.table.lower() in users_aliases
+                                    or (not col.table and has_users_table)
+                                )
+                            )
+                        )
+                        for col in projection.find_all(exp.Column)
+                    ):
+                        if is_outer_select and not hard_linkage_blocked:
+                            hard_violations.append(
+                                "Queries must not associate customer identifiers with demographic attributes."
+                            )
+                            hard_linkage_blocked = True
+                        elif not is_outer_select and not soft_linkage_blocked:
+                            soft_violations.append(
+                                "Do not project customer identifiers alongside demographic attributes in subqueries; "
+                                "aggregate directly in a single SELECT using COUNT(DISTINCT u.id)."
+                            )
+                            soft_linkage_blocked = True
+                        break
+
             select_demographics = [
                 column
                 for projection in select.expressions
                 for column in projection.find_all(exp.Column)
-                if column.name.lower() in DEMOGRAPHIC_COLUMNS
+                if self._policy.is_demographic_column(column.name)
+                and column.find_ancestor(exp.Select) is select
             ]
             if not select_demographics:
                 continue
@@ -199,13 +247,13 @@ class SQLPolicyEngine:
             group = select.args.get("group")
             having = select.args.get("having")
             if group is None or having is None:
-                violations.append(
+                soft_violations.append(
                     "Demographic fields may only be returned as groups with a minimum-size HAVING guard."
                 )
                 continue
 
             if any(column.table.lower() not in users_aliases for column in select_demographics):
-                violations.append(
+                soft_violations.append(
                     "Demographic fields must be qualified columns from the users table."
                 )
 
@@ -218,17 +266,17 @@ class SQLPolicyEngine:
                 column.sql(dialect="bigquery").lower() for column in select_demographics
             }
             if not projected_demographics.issubset(grouped_columns):
-                violations.append(
+                soft_violations.append(
                     "Every returned demographic field must be an explicit GROUP BY key."
                 )
 
             if not self._has_minimum_group_guard(having, users_aliases):
-                violations.append(
+                soft_violations.append(
                     "Demographic groups must use "
                     f"HAVING COUNT(DISTINCT customer) >= {self._demographic_min_group_size}."
                 )
 
-        return violations
+        return hard_violations, soft_violations
 
     def _has_minimum_group_guard(
         self,
@@ -257,7 +305,9 @@ class SQLPolicyEngine:
             if len(columns) != 1:
                 continue
             column = columns[0]
-            if column.name.lower() == "id" and column.table.lower() in users_aliases:
+            if (
+                column.name.lower() == "id" and column.table.lower() in users_aliases
+            ) or self._policy.is_user_identifier_column(column.name):
                 return True
         return False
 
@@ -292,8 +342,12 @@ class SQLPolicyEngine:
             "INNER JOIN __allowed_products AS p ON oi.product_id = p.id"
             "), "
             "__scoped_orders AS ("
-            f"SELECT o.* FROM `{self._dataset_id}.orders` AS o WHERE EXISTS ("
-            "SELECT 1 FROM __scoped_order_items AS oi WHERE oi.order_id = o.order_id)"
+            "SELECT o.order_id, o.user_id, o.status, o.gender, o.created_at, "
+            "o.returned_at, o.shipped_at, o.delivered_at, COUNT(oi.id) AS num_of_item "
+            f"FROM `{self._dataset_id}.orders` AS o "
+            "INNER JOIN __scoped_order_items AS oi ON oi.order_id = o.order_id "
+            "GROUP BY o.order_id, o.user_id, o.status, o.gender, o.created_at, "
+            "o.returned_at, o.shipped_at, o.delivered_at"
             "), "
             "__scoped_users AS ("
             f"SELECT u.* FROM `{self._dataset_id}.users` AS u WHERE EXISTS ("

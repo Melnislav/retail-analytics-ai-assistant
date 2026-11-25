@@ -1,63 +1,53 @@
-# AI Coding Agent Guidelines
+# AI Agent Contribution Contract
 
-This repository enforces strict static analysis, linting, formatting, and type-checking using **Ruff** and **Mypy**.
-All AI coding agents (Junie, Cursor, Claude Code, Cline, Windsurf, Aider, GitHub Copilot) must follow the early feedback workflow described below.
+## Project Context
 
----
+This repository contains a Python 3.12 retail analytics assistant. It accepts natural-language analysis requests, applies deterministic privacy and SQL policy checks, executes read-only analytics, and manages user-owned saved reports. Keep domain policy independent of frameworks and adapters.
 
-## Fast Feedback Loop (Run Early & Often)
+Before making **any architectural change**, read the [High-Level Design](documentation/high_level_design_HLD.md). The assessment file is the source of project goals and requirements; do not duplicate or reinterpret its scope in implementation documentation.
 
-Whenever you edit or add any Python file, you **must** run the following verification checks immediately:
+## Directory Map
 
-### 1. Fast Linting & Auto-fix
-```bash
-ruff check .
-# Or apply safe automatic fixes:
-ruff check --fix .
+```text
+app/
+├── domain/          # Models, semantic glossary, PII masking, SQL policy, domain exceptions
+├── application/     # Use cases, ports, chat orchestration, report lifecycle
+├── adapters/        # HTTP and CLI inbound adapters; BigQuery, LLM, persistence, telemetry outbound adapters
+├── infrastructure/  # Settings and dependency-composition root
+└── main.py          # FastAPI application and lifecycle
+configs/             # Local RBAC configuration
+documentation/       # Requirements and the authoritative HLD
+tests/               # Unit, integration, CLI/RBAC, resilience, and glossary tests
 ```
 
-### 2. Code Formatting Check
+## Environment, Run, and Verification
+
 ```bash
-ruff format --check .
-# Or reformat files:
-ruff format .
+# Install all runtime and development dependencies
+uv sync --all-extras
+
+# Start the full local stack and CLI
+docker compose up --build -d
+docker compose --profile cli run --rm cli
+
+# Test suite
+uv run pytest -v
+
+# Required checks after every Python change
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy .
+
+# Optional local commit gate
+uv run pre-commit run --all-files
 ```
 
-### 3. Static Type Verification
-```bash
-mypy .
-```
+## Engineering Rules
 
-> **Rule:** Never mark a task as completed or commit changes if `ruff check`, `ruff format --check`, or `mypy` report any errors or warnings.
-
----
-
-## 🛠 Tooling Configuration Reference
-
-All configurations are centralized in `pyproject.toml`:
-- **Python version:** `>=3.12`
-- **Line length:** `100` characters
-- **Ruff rules enabled:**
-  - `E`, `W` (pycodestyle errors & warnings)
-  - `F` (Pyflakes syntax & import checks)
-  - `I` (isort import ordering)
-  - `B` (flake8-bugbear common bugs & design pitfalls)
-  - `C4` (flake8-comprehensions)
-  - `UP` (pyupgrade Python 3.12+ modernization)
-  - `SIM` (flake8-simplify code simplification)
-  - `RUF` (Ruff-specific rules)
-- **FastAPI Dependency Injection:**
-  - `B008` is configured to allow `Depends()`, `Header()`, `Query()`, etc. in default arguments.
-- **Mypy:**
-  - Configured with `check_untyped_defs = true`, `disallow_incomplete_defs = true`, `no_implicit_optional = true`.
-  - Pydantic v2 support enabled.
-
----
-
-## Git Pre-Commit Hooks
-
-A `.pre-commit-config.yaml` is configured in the root directory. To run all hooks across the repository:
-```bash
-pre-commit run --all-files
-```
-This intercepts any issues before git commits are created.
+- Preserve the hexagonal boundary: domain and application code depend on ports, never concrete adapters or web frameworks.
+- Keep one responsibility per module and centralize security, privacy, and metric rules rather than copying them between layers.
+- Treat user identity and allowed brands as trusted context supplied by the appropriate adapter; enforce least privilege and fail closed.
+- Do not expose PII to an LLM, logs, or responses. Do not weaken the read-only SQL and k-anonymity controls.
+- Saved-report deletion must remain owner-scoped and require an explicit confirmation step.
+- Update the HLD when an approved architectural decision, component boundary, data flow, or production assumption changes. Keep setup instructions in `README.md` and agent-only rules here.
+- When editing Python, run all three required verification commands above. Do not commit or mark work complete while any of them reports an error or warning.

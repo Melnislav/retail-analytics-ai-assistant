@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -15,8 +16,21 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from app.domain.models import ChatRequest, ConfirmationRequest, UserContext, UserRole
-from app.infrastructure.config import get_settings, load_user_rbac_profiles
+from app.domain.exceptions import (
+    DomainError,
+    ExternalServiceUnavailableError,
+    QueryExecutionError,
+    SecurityViolationError,
+    SQLSafetyError,
+    UnauthorizedDataAccessError,
+)
+from app.domain.models import ChatRequest, ConfirmationRequest, UserContext
+from app.infrastructure.config import (
+    configure_logging,
+    get_settings,
+    load_user_rbac_profiles,
+    resolve_local_user_context,
+)
 
 if TYPE_CHECKING:
     from app.infrastructure.container import ApplicationContainer
@@ -39,42 +53,27 @@ class RetailAssistantCLI:
         self.container: ApplicationContainer | None = None
 
         profiles = load_user_rbac_profiles()
-        selected_profile = None
-        if user_key and user_key in profiles:
-            selected_profile = profiles[user_key]
-        elif not user_key and "brand_manager_alice" in profiles:
-            selected_profile = profiles["brand_manager_alice"]
-
-        if selected_profile:
-            self.user_id = selected_profile["user_id"]
-            self.user_name = selected_profile["display_name"]
-            self.user_role = selected_profile["role"]
-            self.allowed_brands = ",".join(selected_profile.get("allowed_brands", []))
-        else:
-            self.user_id = os.getenv("CLI_USER_ID", "manager_alice")
-            self.user_name = os.getenv("CLI_USER_NAME", "Alice (Brand Manager)")
-            self.user_role = os.getenv("CLI_USER_ROLE", "brand_manager")
-            self.allowed_brands = os.getenv("CLI_ALLOWED_BRANDS", "")
+        self.profile_key = user_key or os.getenv("PROTOTYPE_USER_PROFILE") or "brand_manager_alice"
+        if self.profile_key not in profiles:
+            raise ValueError(f"Unknown local RBAC profile: {self.profile_key}")
+        self._apply_profile(self.profile_key)
 
     @property
     def headers(self) -> dict[str, str]:
-        return {
-            "X-User-Id": self.user_id,
-            "X-User-Name": self.user_name,
-            "X-User-Role": self.user_role,
-            "X-Allowed-Brands": self.allowed_brands,
-        }
+        """No caller-controlled identity headers are sent to the prototype HTTP API."""
+        return {}
 
     @property
     def user_context(self) -> UserContext:
-        brands = [b.strip() for b in self.allowed_brands.split(",") if b.strip()]
-        role = UserRole.CEO if self.user_role.lower() == "ceo" else UserRole.BRAND_MANAGER
-        return UserContext(
-            user_id=self.user_id,
-            display_name=self.user_name,
-            role=role,
-            allowed_brands=brands,
-        )
+        return resolve_local_user_context(self.profile_key)
+
+    def _apply_profile(self, profile_key: str) -> None:
+        profile = resolve_local_user_context(profile_key)
+        self.profile_key = profile_key
+        self.user_id = profile.user_id
+        self.user_name = profile.display_name
+        self.user_role = profile.role.value
+        self.allowed_brands = ",".join(profile.allowed_brands)
 
     def print_banner(self) -> None:
         app_title = os.getenv("APP_NAME", "Retail Data Analysis Assistant")
@@ -84,8 +83,9 @@ class RetailAssistantCLI:
                 f"[bold cyan]{app_title} (CLI)[/bold cyan]\n"
                 f"User: [green]{self.user_name}[/green] (`{self.user_id}`, role=`{self.user_role}`)\n"
                 f"Session: [yellow]{self.session_id}[/yellow] | Mode: [magenta]{mode_str}[/magenta]\n"
-                "Commands: [bold]/help[/bold], [bold]/users[/bold], [bold]/user <id>[/bold], [bold]/clear[/bold], "
-                "[bold]/reports[/bold], [bold]/save <question>[/bold], [bold]/exit[/bold]",
+                "Commands: [bold]/help[/bold], [bold]/users[/bold], [bold]/user <id>[/bold] (standalone), [bold]/clear[/bold], "
+                "[bold]/reports[/bold], [bold]/report <id>[/bold], [bold]/save <question>[/bold], "
+                "[bold]/metrics[/bold], [bold]/trace \\[id][/bold], [bold]/exit[/bold]",
                 border_style="cyan",
             )
         )
@@ -108,16 +108,61 @@ class RetailAssistantCLI:
                 '   • "Delete all reports made in this conversation"\n\n'
                 "[bold yellow]Available Commands:[/bold yellow]\n"
                 "• [bold]/users[/bold] - List available RBAC profiles from configs/users_rbac.yaml\n"
-                "• [bold]/user <name>[/bold] - Switch persona (e.g. /user ceo or /user alice)\n"
-                "• [bold]/role <role> [brands][/bold] - Custom role switch (e.g. /role brand_manager Nike)\n"
+                "• [bold]/user <name>[/bold] - Switch persona in --standalone mode (e.g. /user ceo)\n"
                 "• [bold]/clear[/bold] - Reset session conversation memory\n"
                 "• [bold]/reports[/bold] - List your saved reports\n"
+                "• [bold]/report <id>[/bold] - View a full saved report (question, SQL, and answer)\n"
                 "• [bold]/save <query>[/bold] - Ask question and save executive report\n"
+                "• [bold]/metrics[/bold] - Show local agent counters and latency percentiles\n"
+                "• [bold]/trace \\[id][/bold] - Inspect recent execution traces or a specific trace ID\n"
                 "• [bold]/exit[/bold] - Exit CLI",
                 title="[bold green]Retail Assistant Help & Sample Queries[/bold green]",
                 border_style="green",
             )
         )
+
+    @staticmethod
+    def _render_standalone_error(exc: Exception) -> None:
+        if isinstance(exc, (SecurityViolationError, SQLSafetyError, UnauthorizedDataAccessError)):
+            console.print(
+                Panel(
+                    f"[bold red]{exc.message}[/bold red]",
+                    title="[bold red]Security / Policy Refusal[/bold red]",
+                    border_style="red",
+                )
+            )
+        elif isinstance(exc, QueryExecutionError):
+            console.print(
+                Panel(
+                    f"[bold yellow]{exc.message}[/bold yellow]",
+                    title="[bold yellow]Query Execution Error[/bold yellow]",
+                    border_style="yellow",
+                )
+            )
+        elif isinstance(exc, ExternalServiceUnavailableError):
+            console.print(
+                Panel(
+                    f"[bold red]{exc.message}[/bold red]",
+                    title="[bold red]Service Unavailable[/bold red]",
+                    border_style="red",
+                )
+            )
+        elif isinstance(exc, DomainError):
+            console.print(
+                Panel(
+                    f"[bold yellow]{exc.message}[/bold yellow]",
+                    title="[bold yellow]Request Error[/bold yellow]",
+                    border_style="yellow",
+                )
+            )
+        else:
+            console.print(
+                Panel(
+                    f"[bold red]Unexpected error:[/bold red] {exc}",
+                    title="[bold red]Unexpected Error[/bold red]",
+                    border_style="red",
+                )
+            )
 
     async def _send_chat(
         self, client: httpx.AsyncClient | None, text: str, save_flag: bool
@@ -128,7 +173,11 @@ class RetailAssistantCLI:
                 message=text,
                 save_report=save_flag,
             )
-            res = await self.container.chat_orchestrator.handle_message(req, self.user_context)
+            try:
+                res = await self.container.chat_orchestrator.handle_message(req, self.user_context)
+            except Exception as exc:
+                self._render_standalone_error(exc)
+                return None
             return {
                 "reply": res.reply,
                 "sql_used": res.sql_used,
@@ -195,7 +244,11 @@ class RetailAssistantCLI:
                 token=token,
                 approved=approved,
             )
-            res = await self.container.chat_orchestrator.confirm_action(req, self.user_context)
+            try:
+                res = await self.container.chat_orchestrator.confirm_action(req, self.user_context)
+            except Exception as exc:
+                self._render_standalone_error(exc)
+                return None
             return {"reply": res.reply}
 
         if client is None:
@@ -211,6 +264,11 @@ class RetailAssistantCLI:
                     "approved": approved,
                 },
             )
+            if conf_resp.status_code != 200:
+                console.print(
+                    f"[bold red]API Error ({conf_resp.status_code}):[/bold red] {conf_resp.text}"
+                )
+                return None
             return conf_resp.json()
         except Exception as exc:
             console.print(f"[bold red]Error confirming operation:[/bold red] {exc}")
@@ -219,7 +277,11 @@ class RetailAssistantCLI:
     async def _list_reports(self, client: httpx.AsyncClient | None) -> None:
         reports_list: list[dict[str, Any]] = []
         if self.standalone and self.container:
-            reports = await self.container.report_repo.list_by_owner(self.user_id)
+            try:
+                reports = await self.container.report_service.list_user_reports(self.user_context)
+            except Exception as exc:
+                self._render_standalone_error(exc)
+                return
             reports_list = [r.model_dump() for r in reports]
         elif client:
             try:
@@ -246,17 +308,205 @@ class RetailAssistantCLI:
                 str(r["report_id"])[:8], str(r.get("title", "")), str(r.get("created_at", ""))
             )
         console.print(tbl)
+        console.print("[dim]Tip: run /report <id> to inspect question, SQL, and answer.[/dim]")
+
+    async def _view_report(self, client: httpx.AsyncClient | None, report_id: str) -> None:
+        normalized_id = report_id.strip()
+        if not normalized_id:
+            console.print("[yellow]Usage: /report <id>[/yellow]")
+            return
+
+        report_data: dict[str, Any] | None = None
+        if self.standalone and self.container:
+            try:
+                report = await self.container.report_service.get_user_report(
+                    self.user_context, normalized_id
+                )
+            except Exception as exc:
+                self._render_standalone_error(exc)
+                return
+            report_data = report.model_dump(mode="json") if report else None
+        elif client:
+            try:
+                resp = await client.get(
+                    f"{self.base_url}/api/v1/reports/{normalized_id}",
+                    headers=self.headers,
+                )
+                if resp.status_code == 200:
+                    report_data = resp.json()
+                elif resp.status_code == 404:
+                    report_data = None
+                else:
+                    console.print(f"[red]Error {resp.status_code}: {resp.text}[/red]")
+                    return
+            except Exception as exc:
+                console.print(f"[bold red]Error fetching report:[/bold red] {exc}")
+                return
+
+        if not report_data:
+            console.print(
+                f"[yellow]Report '{normalized_id}' not found for user '{self.user_id}'.[/yellow]"
+            )
+            return
+
+        question = report_data.get("question") or "(not recorded)"
+        sql_used = report_data.get("sql_used") or "(none)"
+        header_md = (
+            f"**ID:** `{report_data['report_id']}`  \n"
+            f"**Created:** {report_data.get('created_at', '')}  \n"
+            f"**Question:** {question}\n\n"
+            f"**SQL:**\n```sql\n{sql_used}\n```\n\n"
+            f"---\n\n{report_data.get('content_markdown', '')}"
+        )
+        console.print(
+            Panel(
+                Markdown(header_md),
+                title=f"Saved Report: {report_data.get('title', 'Untitled')}",
+                border_style="cyan",
+            )
+        )
+
+    async def _show_metrics(self, client: httpx.AsyncClient | None) -> None:
+        snapshot: dict[str, Any] | None = None
+        if self.standalone and self.container:
+            snapshot = self.container.observability.get_metrics_snapshot()
+        elif client:
+            try:
+                resp = await client.get(f"{self.base_url}/api/v1/metrics", headers=self.headers)
+                if resp.status_code == 200:
+                    snapshot = resp.json()
+                else:
+                    console.print(f"[red]Error {resp.status_code}: {resp.text}[/red]")
+                    return
+            except Exception as exc:
+                console.print(f"[bold red]Error fetching metrics:[/bold red] {exc}")
+                return
+
+        if not snapshot:
+            console.print("[dim]No metrics available.[/dim]")
+            return
+
+        tbl = Table(title="Agent Observability Metrics")
+        tbl.add_column("Metric", style="cyan")
+        tbl.add_column("Value", style="bold")
+        for key, val in sorted((snapshot.get("counters") or {}).items()):
+            tbl.add_row(str(key), str(val))
+        lat = snapshot.get("latency_ms") or {}
+        if lat:
+            tbl.add_row(
+                "latency_ms (p50 / p95 / p99)",
+                f"{lat.get('p50', 0)} / {lat.get('p95', 0)} / {lat.get('p99', 0)} (n={lat.get('count', 0)})",
+            )
+        if snapshot.get("trace_log_path"):
+            tbl.add_row("trace_log_path", str(snapshot["trace_log_path"]))
+        console.print(tbl)
+
+    async def _show_trace(
+        self, client: httpx.AsyncClient | None, trace_id: str | None = None
+    ) -> None:
+        scoped_user = None if self.user_role in {"ceo", "admin"} else self.user_id
+        if trace_id:
+            record_data: dict[str, Any] | None = None
+            if self.standalone and self.container:
+                rec = self.container.observability.get_trace(trace_id, user_id=scoped_user)
+                record_data = rec.model_dump(mode="json") if rec else None
+            elif client:
+                try:
+                    resp = await client.get(
+                        f"{self.base_url}/api/v1/traces/{trace_id}", headers=self.headers
+                    )
+                    if resp.status_code == 200:
+                        record_data = resp.json()
+                    elif resp.status_code != 404:
+                        console.print(f"[red]Error {resp.status_code}: {resp.text}[/red]")
+                        return
+                except Exception as exc:
+                    console.print(f"[bold red]Error fetching trace:[/bold red] {exc}")
+                    return
+
+            if not record_data:
+                console.print(f"[yellow]Trace '{trace_id}' not found.[/yellow]")
+                return
+
+            raw_resp = str(record_data.get("pii_redacted_response") or "").strip()
+            resp_preview = (
+                (raw_resp[:300] + "...") if len(raw_resp) > 300 else (raw_resp or "(empty)")
+            )
+            detail_md = (
+                f"**Trace ID:** `{record_data['trace_id']}` | **User:** `{record_data['user_id']}` | "
+                f"**Session:** `{record_data['session_id']}`  \n"
+                f"**Intent:** `{record_data.get('intent_classified')}` | **AST Valid:** `{record_data.get('ast_valid')}` | "
+                f"**Fallback Used:** `{record_data.get('fallback_used')}`  \n"
+                f"**Latency:** {record_data.get('latency_ms', 0)} ms | "
+                f"**LLM Calls:** {record_data.get('llm_calls_count', 0)} | "
+                f"**Tokens:** in={record_data.get('input_tokens', 0)} / out={record_data.get('output_tokens', 0)} | "
+                f"**Cost:** ${record_data.get('total_cost_usd', 0):.6f} | "
+                f"**BQ Bytes:** {record_data.get('bq_bytes_billed', 0)}  \n"
+                f"**Error Type:** `{record_data.get('error_type')}`  \n"
+                f"**Prompt (redacted):** {record_data.get('pii_redacted_prompt', '')}  \n"
+                f"**Response (redacted):** {resp_preview}\n\n"
+                f"**SQL:**\n```sql\n{record_data.get('generated_sql') or '(none)'}\n```"
+            )
+            console.print(
+                Panel(Markdown(detail_md), title="Execution Trace Detail", border_style="magenta")
+            )
+            return
+
+        traces_list: list[dict[str, Any]] = []
+        if self.standalone and self.container:
+            recs = self.container.observability.get_recent_traces(limit=10, user_id=scoped_user)
+            traces_list = [r.model_dump(mode="json") for r in recs]
+        elif client:
+            try:
+                resp = await client.get(f"{self.base_url}/api/v1/traces", headers=self.headers)
+                if resp.status_code == 200:
+                    traces_list = resp.json()
+                else:
+                    console.print(f"[red]Error {resp.status_code}: {resp.text}[/red]")
+                    return
+            except Exception as exc:
+                console.print(f"[bold red]Error fetching traces:[/bold red] {exc}")
+                return
+
+        if not traces_list:
+            console.print("[dim]No execution traces recorded yet.[/dim]")
+            return
+
+        tbl = Table(title="Recent Execution Traces")
+        tbl.add_column("Trace ID", style="cyan")
+        tbl.add_column("Intent")
+        tbl.add_column("LLM")
+        tbl.add_column("Cost ($)")
+        tbl.add_column("Latency (ms)")
+        tbl.add_column("Error")
+        for tr in traces_list:
+            tbl.add_row(
+                str(tr.get("trace_id", "")),
+                str(tr.get("intent_classified", "")),
+                str(tr.get("llm_calls_count", 0)),
+                f"{float(tr.get('total_cost_usd', 0)):.5f}",
+                str(tr.get("latency_ms", 0)),
+                str(tr.get("error_type") or "-"),
+            )
+        console.print(tbl)
+        console.print(
+            "[dim]Tip: run /trace <trace_id> to inspect prompt, SQL, and failure reason.[/dim]"
+        )
 
     async def run(self) -> None:
         if self.standalone:
             from app.infrastructure.container import ApplicationContainer
 
             settings = get_settings()
+            log_dir = (
+                Path(settings.trace_log_path).parent if settings.trace_log_path else Path("logs")
+            )
+            configure_logging(settings.log_level, log_file=log_dir / "app.log")
             self.container = ApplicationContainer(settings)
             await self.container.startup()
 
         self.print_banner()
-        timeout = float(os.getenv("CLI_TIMEOUT_SECONDS", "60.0"))
+        timeout = float(os.getenv("CLI_TIMEOUT_SECONDS", "120.0"))
         client_ctx = httpx.AsyncClient(timeout=timeout) if not self.standalone else None
 
         try:
@@ -300,6 +550,13 @@ class RetailAssistantCLI:
                     continue
 
                 if text.lower().startswith("/user "):
+                    if not self.standalone:
+                        console.print(
+                            "[yellow]Cannot switch personas in HTTP mode: the API enforces its "
+                            "server-configured PROTOTYPE_USER_PROFILE. Run with --standalone to "
+                            "switch profiles locally.[/yellow]"
+                        )
+                        continue
                     target_key = text.split(maxsplit=1)[1].strip()
                     profiles = load_user_rbac_profiles()
                     match = profiles.get(target_key)
@@ -312,10 +569,8 @@ class RetailAssistantCLI:
                                 match = v
                                 break
                     if match:
-                        self.user_id = match["user_id"]
-                        self.user_name = match["display_name"]
-                        self.user_role = match["role"]
-                        self.allowed_brands = ",".join(match.get("allowed_brands", []))
+                        matched_key = next(key for key, value in profiles.items() if value is match)
+                        self._apply_profile(matched_key)
                         console.print(
                             f"[green]Switched active user to [bold]{self.user_name}[/bold] "
                             f"(`{self.user_id}`, role=`{self.user_role}`, brands=`{self.allowed_brands or 'ALL'}`)[/green]"
@@ -330,13 +585,32 @@ class RetailAssistantCLI:
                     await self._list_reports(client_ctx)
                     continue
 
+                if text.lower() == "/report":
+                    console.print("[yellow]Usage: /report <id>[/yellow]")
+                    continue
+
+                if text.lower().startswith("/report "):
+                    target_id = text.split(maxsplit=1)[1].strip()
+                    await self._view_report(client_ctx, target_id)
+                    continue
+
+                if text.lower() == "/metrics":
+                    await self._show_metrics(client_ctx)
+                    continue
+
+                if text.lower() == "/trace":
+                    await self._show_trace(client_ctx)
+                    continue
+
+                if text.lower().startswith("/trace "):
+                    target_trace_id = text.split(maxsplit=1)[1].strip()
+                    await self._show_trace(client_ctx, target_trace_id)
+                    continue
+
                 if text.lower().startswith("/role "):
-                    parts = text.split(maxsplit=2)
-                    self.user_role = parts[1]
-                    self.allowed_brands = parts[2] if len(parts) > 2 else ""
                     console.print(
-                        f"[yellow]Switched role to `{self.user_role}` "
-                        f"(brands: `{self.allowed_brands or 'NONE'}`)[/yellow]"
+                        "[yellow]Role overrides are disabled. Use /users then /user <profile> "
+                        "to select a configured local profile.[/yellow]"
                     )
                     continue
 
@@ -360,16 +634,21 @@ class RetailAssistantCLI:
 
                 pending = data.get("pending_confirmation")
                 if pending:
+                    hash_hint = (
+                        f" (hash: {pending['payload_hash'][:12]})"
+                        if pending.get("payload_hash")
+                        else ""
+                    )
                     approved = await asyncio.to_thread(
                         Confirm.ask,
-                        f"[bold red]Confirm permanent deletion of {len(pending['target_report_ids'])} report(s)?[/bold red]",
+                        f"[bold red]Confirm permanent deletion of {len(pending['target_report_ids'])} report(s){hash_hint}?[/bold red]",
                         default=False,
                     )
                     conf_data = await self._confirm_action(client_ctx, pending["token"], approved)
                     if conf_data:
                         console.print(
                             Panel(
-                                Markdown(conf_data["reply"]),
+                                Markdown(conf_data.get("reply", "")),
                                 title="Confirmation Result",
                                 border_style="yellow",
                             )
@@ -413,7 +692,10 @@ def main() -> None:
         user_key=args.user,
         standalone=args.standalone,
     )
-    asyncio.run(cli.run())
+    try:
+        asyncio.run(cli.run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted. Exiting CLI.[/yellow]")
 
 
 if __name__ == "__main__":
