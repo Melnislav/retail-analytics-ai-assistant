@@ -133,6 +133,61 @@ def test_sql_policy_blocks_user_id_demographic_linkage_and_allows_valid_queries(
     assert valid_grouped_oi_user_id.is_valid
 
 
+def test_sql_policy_treats_subquery_user_demo_projection_as_soft_when_outer_is_aggregated() -> None:
+    policy = SQLPolicyEngine(demographic_min_group_size=5)
+    ceo = UserContext(user_id="ceo", role=UserRole.CEO)
+
+    nested_avg = policy.validate_and_secure(
+        "SELECT u.state, ROUND(AVG(user_total_spend), 2) AS avg_customer_spend "
+        "FROM (SELECT u.id AS user_id, u.state, SUM(oi.sale_price) AS user_total_spend "
+        "FROM users u JOIN order_items oi ON u.id = oi.user_id "
+        "WHERE oi.status NOT IN ('Cancelled', 'Returned') GROUP BY 1, 2) AS user_spend_summary "
+        "GROUP BY 1 HAVING COUNT(DISTINCT user_id) >= 5 ORDER BY avg_customer_spend DESC LIMIT 100",
+        ceo,
+    )
+    assert not nested_avg.is_valid
+    assert nested_avg.severity == "soft"
+
+    outer_leak = policy.validate_and_secure(
+        "SELECT sub.user_id, sub.state FROM (SELECT u.id AS user_id, u.state FROM users u) AS sub",
+        ceo,
+    )
+    assert not outer_leak.is_valid
+    assert outer_leak.severity == "hard"
+
+
+@pytest.mark.asyncio
+async def test_sql_prompt_guides_single_level_explicit_demographic_group_by() -> None:
+    from unittest.mock import MagicMock
+
+    from langchain_core.messages import BaseMessage
+    from langchain_core.runnables import RunnableLambda
+
+    from app.adapters.outbound.langchain_adapter import LangChainRetailAgentAdapter, LLMProvider
+
+    captured: list[BaseMessage] = []
+
+    async def capture(messages: list[BaseMessage]) -> SQLPlan:
+        captured.extend(messages)
+        return SQLPlan(reasoning="ok", sql_query="SELECT 1", requires_sql=True)
+
+    mock_model = MagicMock()
+    mock_model.with_structured_output.return_value = RunnableLambda(capture)
+    adapter = LangChainRetailAgentAdapter()
+    adapter._providers = [LLMProvider(name="test", model=mock_model)]
+
+    await adapter.generate_sql_plan(
+        user_message="Compare average customer spend by state",
+        schema_summary="users, order_items",
+        user_context=UserContext(user_id="ceo", role=UserRole.CEO),
+        history=[],
+    )
+    prompt_text = "\n".join(str(m.content) for m in captured)
+    assert "GROUP BY u.<column>" in prompt_text
+    assert "never positional" in prompt_text
+    assert "single SELECT" in prompt_text
+
+
 def test_post_sql_data_guard_enforces_k_anonymity_and_strips_linked_demographics() -> None:
     guard = PostSQLDataGuard(PrivacyPolicy(demographic_min_group_size=5))
 

@@ -629,7 +629,7 @@ class RetailAssistantCLI:
                 pending = data.get("pending_confirmation")
                 if pending:
                     hash_hint = (
-                        f" [hash: {pending['payload_hash'][:12]}]"
+                        f" (hash: {pending['payload_hash'][:12]})"
                         if pending.get("payload_hash")
                         else ""
                     )
@@ -686,7 +686,10 @@ def main() -> None:
         user_key=args.user,
         standalone=args.standalone,
     )
-    asyncio.run(cli.run())
+    try:
+        asyncio.run(cli.run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted. Exiting CLI.[/yellow]")
 
 
 if __name__ == "__main__":

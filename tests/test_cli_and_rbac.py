@@ -117,3 +117,21 @@ async def test_cli_confirm_action_handles_non_200_http_response(
 
     assert res is None
     assert "API Error (503)" in capsys.readouterr().out
+
+
+def test_cli_main_exits_cleanly_on_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+
+    from app.adapters.inbound import cli_client
+
+    async def raise_interrupt(self: RetailAssistantCLI) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sys, "argv", ["cli_client", "--standalone"])
+    monkeypatch.setattr(RetailAssistantCLI, "run", raise_interrupt)
+
+    cli_client.main()
+    out = capsys.readouterr().out
+    assert "Interrupted. Exiting CLI." in out

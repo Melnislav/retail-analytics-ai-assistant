@@ -191,7 +191,8 @@ class SQLPolicyEngine:
             if table.name.lower() == "users" and table.alias_or_name
         }
 
-        linkage_blocked = False
+        hard_linkage_blocked = False
+        soft_linkage_blocked = False
         for select in query.find_all(exp.Select):
             is_outer_select = select.find_ancestor(exp.CTE, exp.Subquery) is None
             select_touches_demographics = any(
@@ -199,7 +200,7 @@ class SQLPolicyEngine:
                 and col.find_ancestor(exp.Select) is select
                 for col in select.find_all(exp.Column)
             )
-            if not linkage_blocked and (is_outer_select or select_touches_demographics):
+            if is_outer_select or select_touches_demographics:
                 has_users_table = any(
                     t.name.lower() == "users" and t.find_ancestor(exp.Select) is select
                     for t in select.find_all(exp.Table)
@@ -220,10 +221,17 @@ class SQLPolicyEngine:
                         )
                         for col in projection.find_all(exp.Column)
                     ):
-                        hard_violations.append(
-                            "Queries must not associate customer identifiers with demographic attributes."
-                        )
-                        linkage_blocked = True
+                        if is_outer_select and not hard_linkage_blocked:
+                            hard_violations.append(
+                                "Queries must not associate customer identifiers with demographic attributes."
+                            )
+                            hard_linkage_blocked = True
+                        elif not is_outer_select and not soft_linkage_blocked:
+                            soft_violations.append(
+                                "Do not project customer identifiers alongside demographic attributes in subqueries; "
+                                "aggregate directly in a single SELECT using COUNT(DISTINCT u.id)."
+                            )
+                            soft_linkage_blocked = True
                         break
 
             select_demographics = [
