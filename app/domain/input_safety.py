@@ -22,7 +22,12 @@ class InputSafetyPolicy:
         re.compile(r"\b(?:reveal|show|dump)\s+(?:the\s+)?system\s+prompt\b", re.IGNORECASE),
         re.compile(r"\bbypass\s+(?:the\s+)?(?:pii|security|guardrail)\b", re.IGNORECASE),
         re.compile(
-            r"\b(?:drop|alter|truncate|insert\s+into|update|delete\s+from)\b",
+            r"\b(?:drop\s+(?:table|database|view|schema)|"
+            r"alter\s+table|"
+            r"truncate\s+table|"
+            r"insert\s+into|"
+            r"update\s+[a-z_][a-z0-9_.]*\s+set|"
+            r"delete\s+from)\b",
             re.IGNORECASE,
         ),
     )

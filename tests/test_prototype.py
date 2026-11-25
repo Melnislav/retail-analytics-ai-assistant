@@ -237,6 +237,23 @@ def test_input_safety_policy_blocks_injection_and_pii_requests() -> None:
     assert policy.inspect("Show net revenue by product category").is_safe is True
 
 
+def test_input_safety_policy_allows_retail_words_and_blocks_sql_dml_ddl() -> None:
+    policy = InputSafetyPolicy()
+
+    # Legitimate retail questions containing drop/update/alter
+    assert policy.inspect("Why did revenue drop last month?").is_safe is True
+    assert policy.inspect("Give me an update on Q1 churn").is_safe is True
+    assert policy.inspect("How do returns alter our net revenue?").is_safe is True
+
+    # Destructive SQL DML/DDL statements must remain blocked
+    assert policy.inspect("DROP TABLE orders").is_safe is False
+    assert policy.inspect("ALTER TABLE users ADD COLUMN x INT64").is_safe is False
+    assert policy.inspect("TRUNCATE TABLE products").is_safe is False
+    assert policy.inspect("INSERT INTO orders VALUES (1)").is_safe is False
+    assert policy.inspect("UPDATE orders SET status = 'Complete'").is_safe is False
+    assert policy.inspect("DELETE FROM orders").is_safe is False
+
+
 @pytest.mark.asyncio
 async def test_end_to_end_report_creation_and_two_step_deletion(tmp_path: Path) -> None:
     test_settings = Settings(
