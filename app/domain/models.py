@@ -95,7 +95,7 @@ class GuardrailDecision(BaseModel):
     rejection_reason: str | None = None
     delete_scope: str | None = Field(
         default=None,
-        description="For DELETE_REPORTS: 'conversation' or 'keyword'",
+        description="For DELETE_REPORTS: 'conversation', 'keyword', or 'all'",
     )
     delete_keyword: str | None = Field(
         default=None,

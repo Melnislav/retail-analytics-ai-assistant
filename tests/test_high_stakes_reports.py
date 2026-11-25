@@ -301,3 +301,120 @@ async def test_cli_view_report_standalone_owner_scoped(
         assert "not found" in bob_out.lower()
     finally:
         await container.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delete_report_by_id_prefix_and_all_scope_are_owner_scoped(
+    tmp_path: Path,
+) -> None:
+    container = ApplicationContainer(_build_test_settings(tmp_path, "del_id_all.db"))
+    await container.startup()
+
+    try:
+        alice = container.prototype_user
+        bob = UserContext(
+            user_id="mgr_bob",
+            display_name="Bob",
+            role=UserRole.BRAND_MANAGER,
+            allowed_brands=["Diesel"],
+        )
+
+        a1 = await container.report_service.save_report(
+            SavedReport(
+                owner_user_id=alice.user_id,
+                session_id="sess_1",
+                question="Q1",
+                title="Alice Revenue Report",
+                summary="S1",
+                content_markdown="Body 1",
+            )
+        )
+        a2 = await container.report_service.save_report(
+            SavedReport(
+                owner_user_id=alice.user_id,
+                session_id="sess_2",
+                question="Q2",
+                title="Alice Margin Report",
+                summary="S2",
+                content_markdown="Body 2",
+            )
+        )
+        b1 = await container.report_service.save_report(
+            SavedReport(
+                owner_user_id=bob.user_id,
+                session_id="sess_bob",
+                question="Q3",
+                title="Bob Diesel Report",
+                summary="S3",
+                content_markdown="Body 3",
+            )
+        )
+
+        # 1. Alice cannot stage deletion of Bob's report ID
+        bob_lookup = await container.chat_orchestrator.handle_message(
+            ChatRequest(session_id="sess_check", message=f"Delete report {b1.report_id[:8]}"),
+            alice,
+        )
+        assert bob_lookup.pending_confirmation is None
+        assert "no matching saved reports" in bob_lookup.reply.lower()
+
+        # 2. Alice deletes her own report a1 by 8-char ID prefix -> confirmation required -> deletes only a1
+        id_stage = await container.chat_orchestrator.handle_message(
+            ChatRequest(session_id="sess_check", message=f"Delete report {a1.report_id[:8]}"),
+            alice,
+        )
+        assert id_stage.pending_confirmation is not None
+        assert id_stage.pending_confirmation.target_report_ids == [a1.report_id]
+        await container.chat_orchestrator.confirm_action(
+            ConfirmationRequest(
+                session_id="sess_check",
+                token=id_stage.pending_confirmation.token,
+                approved=True,
+            ),
+            alice,
+        )
+        assert [r.report_id for r in await container.report_service.list_user_reports(alice)] == [
+            a2.report_id
+        ]
+        assert [r.report_id for r in await container.report_service.list_user_reports(bob)] == [
+            b1.report_id
+        ]
+
+        # 3. Alice requests "Delete all my saved reports" -> stages remaining Alice report (a2), never Bob's
+        a3 = await container.report_service.save_report(
+            SavedReport(
+                owner_user_id=alice.user_id,
+                session_id="sess_3",
+                question="Q4",
+                title="Alice Churn Report",
+                summary="S4",
+                content_markdown="Body 4",
+            )
+        )
+        all_stage = await container.chat_orchestrator.handle_message(
+            ChatRequest(session_id="sess_check", message="Delete all my saved reports"),
+            alice,
+        )
+        assert all_stage.pending_confirmation is not None
+        assert set(all_stage.pending_confirmation.target_report_ids) == {
+            a2.report_id,
+            a3.report_id,
+        }
+        assert all_stage.pending_confirmation.payload_hash[:12] in all_stage.reply
+        # Still intact before confirmation
+        assert len(await container.report_service.list_user_reports(alice)) == 2
+
+        await container.chat_orchestrator.confirm_action(
+            ConfirmationRequest(
+                session_id="sess_check",
+                token=all_stage.pending_confirmation.token,
+                approved=True,
+            ),
+            alice,
+        )
+        assert await container.report_service.list_user_reports(alice) == []
+        assert [r.report_id for r in await container.report_service.list_user_reports(bob)] == [
+            b1.report_id
+        ]
+    finally:
+        await container.shutdown()

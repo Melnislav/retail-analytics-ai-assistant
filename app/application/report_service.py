@@ -58,6 +58,9 @@ class ReportService:
         if scope == "conversation":
             matches = await self._repo.find_by_session(user.user_id, session_id)
             desc = f"Delete {len(matches)} report(s) created in current session '{session_id}'."
+        elif scope == "all":
+            matches = await self._repo.list_by_owner(user.user_id)
+            desc = f"Delete all {len(matches)} saved report(s) owned by your account."
         else:
             search_term = (keyword or "").strip()
             if not search_term:

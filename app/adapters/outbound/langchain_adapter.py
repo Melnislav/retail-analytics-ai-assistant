@@ -314,7 +314,9 @@ class LangChainRetailAgentAdapter:
             "3. Block unrelated non-retail requests (e.g., jokes, poems, politics, coding help) -> BLOCKED_OFF_TOPIC.\n"
             "4. Detect destructive report deletion requests:\n"
             "   - 'Delete all the reports we made in this conversation' -> DELETE_REPORTS, delete_scope='conversation'\n"
+            "   - 'Delete all my saved reports' -> DELETE_REPORTS, delete_scope='all'\n"
             "   - 'Delete all reports mentioning Client X' -> DELETE_REPORTS, delete_scope='keyword', delete_keyword='Client X'\n"
+            "   - 'Delete report <id>' -> DELETE_REPORTS, delete_scope='keyword', delete_keyword='<id>'\n"
             "5. Detect user output preferences if stated (tables vs bullets, concise vs deep_dive)."
         )
         messages: list[SystemMessage | HumanMessage | AIMessage] = [
@@ -354,13 +356,32 @@ class LangChainRetailAgentAdapter:
                     is_safe=True,
                     delete_scope="conversation",
                 )
-            match = re.search(r"mentioning\s+['\"]?([^'\"]+)['\"]?", text, flags=re.IGNORECASE)
-            keyword = match.group(1).strip() if match else text.split("report")[-1].strip(" .?!")
+            mention_match = re.search(
+                r"mentioning\s+['\"`]?([^'\"`]+?)['\"`]?[.?!]*$",
+                text.strip(),
+                flags=re.IGNORECASE,
+            )
+            if mention_match:
+                return GuardrailDecision(
+                    intent=IntentType.DELETE_REPORTS,
+                    is_safe=True,
+                    delete_scope="keyword",
+                    delete_keyword=mention_match.group(1).strip(),
+                )
+            trailing = re.split(r"\breports?\b", text, maxsplit=1, flags=re.IGNORECASE)[-1].strip(
+                " .?!'\"`#"
+            )
+            if re.search(r"\ball\b", low) and not trailing:
+                return GuardrailDecision(
+                    intent=IntentType.DELETE_REPORTS,
+                    is_safe=True,
+                    delete_scope="all",
+                )
             return GuardrailDecision(
                 intent=IntentType.DELETE_REPORTS,
                 is_safe=True,
                 delete_scope="keyword",
-                delete_keyword=keyword or "Client",
+                delete_keyword=trailing or "Client",
             )
 
         if ("list" in low or "show" in low) and "saved report" in low:

@@ -158,11 +158,18 @@ class PostgresReportRepository:
 
     async def find_by_keyword(self, owner_user_id: str, keyword: str) -> list[SavedReport]:
         reports = await self.list_by_owner(owner_user_id)
-        normalized_keyword = keyword.lower()
+        normalized_keyword = keyword.strip().lower()
+        if not normalized_keyword:
+            return []
         return [
             report
             for report in reports
-            if normalized_keyword in report.title.lower()
+            if report.report_id.lower() == normalized_keyword
+            or (
+                len(normalized_keyword) >= 4
+                and report.report_id.lower().startswith(normalized_keyword)
+            )
+            or normalized_keyword in report.title.lower()
             or normalized_keyword in report.question.lower()
             or normalized_keyword in report.summary.lower()
             or normalized_keyword in report.content_markdown.lower()
